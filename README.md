@@ -1,7 +1,5 @@
 # gray-claude-sub
 
-![gray-claude-sub banner](assets/hero-technohellenic.png)
-
 > **Claude Pro/Max subscription model-provider sidecar plugin for the [gray](https://github.com/vstaln/gray) agent harness.**
 
 `gray-claude-sub` drives the official `claude` CLI fully inert (`--tools ''`, no MCP servers, no slash commands, `dontAsk`, no session persistence) as a request-scoped model provider. Gray owns the agent loop, tools, approvals, and compaction — Claude only answers.
@@ -113,7 +111,6 @@ The sidecar communicates over standard I/O using newline-delimited JSON (NDJSON)
 ## Repository Structure
 
 ```text
-├── assets/                  # Hero banners and documentation visual assets
 ├── src/
 │   ├── main.rs              # Protocol-1.2 sidecar entry point
 │   ├── chat.rs              # Request translation, streaming parser, and CLI runner
