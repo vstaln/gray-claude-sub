@@ -84,6 +84,16 @@ fn text_of(blocks: &Value) -> String {
     }
 }
 
+/// Kind of a Responses input item: the `type` field, or "message" for the
+/// EasyInputMessage short form (role present, type absent) the host emits.
+fn item_kind(item: &Value) -> &str {
+    match item.get("type").and_then(Value::as_str) {
+        Some(k) => k,
+        None if item.get("role").is_some() => "message",
+        None => "",
+    }
+}
+
 /// Translate an OpenAI Responses body into native history frames.
 /// Assistant tool calls go out prefixed; reasoning items carrying our own
 /// native carrier restore byte-identical frames when the projection matches.
@@ -124,8 +134,8 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     // First pass: collect tool_call ids so outputs can join them.
     let mut calls: BTreeMap<String, (String, Value)> = BTreeMap::new();
     for item in &input {
-        match item.get("type").and_then(Value::as_str) {
-            Some("function_call") => {
+        match item_kind(item) {
+            "function_call" => {
                 let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("");
                 let args: Value = item
@@ -141,7 +151,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                     ),
                 );
             }
-            Some("reasoning") => {
+            "reasoning" => {
                 // Foreign/display-only reasoning never reaches native; our own
                 // carrier restores below when the projection still matches.
             }
@@ -149,8 +159,8 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         }
     }
     for item in &input {
-        match item.get("type").and_then(Value::as_str) {
-            Some("message") => {
+        match item_kind(item) {
+            "message" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("");
                 let content = item.get("content").cloned().unwrap_or(Value::Null);
                 if role == "system" || role == "developer" {
@@ -195,7 +205,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                     );
                 }
             }
-            Some("function_call") => {
+            "function_call" => {
                 let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("");
                 let (rname, args) = calls
@@ -219,7 +229,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                         "message": {"role": "assistant", "content": [block]}}));
                 }
             }
-            Some("function_call_output") => {
+            "function_call_output" => {
                 let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
                 let text = item
                     .get("output")
@@ -251,8 +261,8 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
             _ => {}
         }
     }
-    // Restore native carriers: a `reasoning` item whose encrypted content is
-    // our own native messages replaces the re-derived assistant frame when
+    // Restore native carriers: `reasoning` items whose encrypted content is
+    // our own native messages replace the re-derived assistant frames when
     // the visible projection still matches (host compaction owns history).
     restore_carriers(&input, &mut frames, model);
     let Some(last) = frames.last() else {
@@ -277,12 +287,13 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     })
 }
 
-fn restore_carriers(input: &[Value], frames: &mut [Value], model: &str) {
-    // Collect our own carriers in order; each replaces the nearest preceding
-    // re-derived assistant frame whose projection matches.
-    let mut carriers: Vec<(String, Vec<Value>)> = Vec::new();
+fn restore_carriers(input: &[Value], frames: &mut Vec<Value>, model: &str) {
+    // Collect our own carriers in order: each is one turn's saved native
+    // assistant messages. A carrier's tool_use ids are the host's call_ids,
+    // so re-derived frames and saved messages join on ids the host owns.
+    let mut carriers: Vec<Vec<Value>> = Vec::new();
     for item in input {
-        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        if item_kind(item) != "reasoning" {
             continue;
         }
         let blob = item
@@ -306,39 +317,96 @@ fn restore_carriers(input: &[Value], frames: &mut [Value], model: &str) {
         // relay trusts the host to only send back what it stamped.
         let _ = model;
         if let Some(saved) = saved {
-            // Projection text: the assistant message text this carrier was captured with.
-            carriers.push((String::new(), saved));
+            carriers.push(saved);
         }
     }
     if carriers.is_empty() {
         return;
     }
-    // Replace re-derived assistant frames positionally: carriers were
-    // captured in turn order, one per assistant message with text.
-    let mut ci = 0;
-    for f in frames.iter_mut() {
-        if ci >= carriers.len() {
-            break;
-        }
-        if f.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let (_, saved) = &carriers[ci];
-        // Only restore when the frame is a pure-text re-derivation (no tool
-        // calls mixed in — those frames carry live ids the host owns).
-        let is_text_only = f
-            .pointer("/message/content")
+    let block_ids = |m: &Value| -> Vec<String> {
+        m.get("content")
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let has_tool_use = |m: &Value| !block_ids(m).is_empty();
+    let is_text_only = |f: &Value| {
+        f.pointer("/message/content")
             .and_then(Value::as_array)
             .is_some_and(|blocks| {
                 blocks
                     .iter()
                     .all(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            });
-        if is_text_only {
-            *f = json!({"type": "assistant", "message": saved.first().cloned().unwrap_or(json!({}))});
+            })
+    };
+    // Rebuild: carriers map positionally onto re-derived assistant frames,
+    // one turn's frames per carrier. Text-only frames take the carrier's
+    // text message; tool_use frames take the native messages covering the
+    // same call ids — this restores the signed thinking blocks Anthropic
+    // requires alongside a replayed tool_use (without them the model sees
+    // a bare call and re-issues it, then confabulates a missing result).
+    let mut next_saved: Vec<usize> = vec![0; carriers.len()];
+    let mut ci = 0;
+    let mut out: Vec<Value> = Vec::with_capacity(frames.len() + carriers.len());
+    for f in frames.iter() {
+        if f.get("type").and_then(Value::as_str) != Some("assistant") {
+            out.push(f.clone());
+            continue;
+        }
+        while ci < carriers.len() && next_saved[ci] >= carriers[ci].len() {
             ci += 1;
         }
+        if ci >= carriers.len() {
+            out.push(f.clone());
+            continue;
+        }
+        let ids = block_ids(&f["message"]);
+        if ids.is_empty() && is_text_only(f) {
+            // Text-only frame: take the next saved message that carries no
+            // tool_use of its own.
+            let saved = &carriers[ci];
+            if let Some(pos) = saved[next_saved[ci]..]
+                .iter()
+                .position(|m| !has_tool_use(m))
+            {
+                let idx = next_saved[ci] + pos;
+                out.push(json!({"type": "assistant", "message": saved[idx].clone()}));
+                next_saved[ci] = idx + 1;
+                continue;
+            }
+            out.push(f.clone());
+            continue;
+        }
+        // Tool frame: splice the contiguous run of saved messages whose
+        // tool_use ids cover this frame's ids in order.
+        let saved = &carriers[ci];
+        let mut got: Vec<String> = Vec::new();
+        let mut run = 0;
+        while next_saved[ci] + run < saved.len()
+            && has_tool_use(&saved[next_saved[ci] + run])
+        {
+            got.extend(block_ids(&saved[next_saved[ci] + run]));
+            run += 1;
+            if got == ids {
+                break;
+            }
+        }
+        if !ids.is_empty() && got == ids {
+            for m in &saved[next_saved[ci]..next_saved[ci] + run] {
+                out.push(json!({"type": "assistant", "message": m.clone()}));
+            }
+            next_saved[ci] += run;
+        } else {
+            out.push(f.clone());
+        }
     }
+    *frames = out;
 }
 
 /// Extra body the relay injects: the inert tool manifest native sees.
@@ -395,6 +463,10 @@ pub fn spawn_turn(
         String::new(),
         "--strict-mcp-config".into(),
         "--disable-slash-commands".into(),
+        // One turn: a tool_use ends the native run; the host executes the
+        // call and the result returns as a replayed frame next turn.
+        "--max-turns".into(),
+        "1".into(),
         "--permission-mode".into(),
         "dontAsk".into(),
         "--no-session-persistence".into(),
@@ -423,6 +495,8 @@ pub fn spawn_turn(
         .spawn()
         .map_err(|_| setup::INSTALL_HINT.to_string())?;
     let frames = &turn.frames;
+    let debug = std::env::var_os("CLAUDE_SUB_DEBUG").is_some();
+    let mut sent: Vec<Value> = Vec::new();
     {
         let mut stdin = child
             .stdin
@@ -432,6 +506,9 @@ pub fn spawn_turn(
             let mut f = frame.clone();
             if frame.get("type").and_then(Value::as_str) == Some("user") && i + 1 < frames.len() {
                 f["shouldQuery"] = json!(false);
+            }
+            if debug {
+                sent.push(f.clone());
             }
             let line = serde_json::to_string(&f).map_err(|e| format!("frame encode: {e}"))? + "\n";
             stdin
@@ -444,6 +521,9 @@ pub fn spawn_turn(
         .take()
         .ok_or_else(|| "native stdout unavailable".to_string())?;
     let lines = read_lines(stdout, timeout)?;
+    if debug {
+        dump_debug(&sent, &lines);
+    }
     let status = child.wait().map_err(|e| format!("native wait: {e}"))?;
     let saw_result = lines
         .iter()
@@ -454,10 +534,42 @@ pub fn spawn_turn(
     if !saw_result || !saw_assistant {
         return Err("incomplete native response: assistant and one result required".into());
     }
-    if !status.success() {
+    // error_max_turns is the tool boundary (--max-turns 1): the run can exit
+    // nonzero there while still having produced the calls the host needs.
+    let tool_boundary = lines.iter().any(|v: &Value| {
+        v.get("type").and_then(Value::as_str) == Some("result")
+            && v.get("subtype").and_then(Value::as_str) == Some("error_max_turns")
+    });
+    if !status.success() && !tool_boundary {
         return Err("native request failed (nonzero exit without a success result)".into());
     }
     Ok(lines)
+}
+
+/// CLAUDE_SUB_DEBUG=1 dump: the frames sent to native and the stream-json
+/// lines received, to /tmp/claude-sub-<pid>-<seq>.ndjson mode 0600.
+fn dump_debug(sent: &[Value], lines: &[Value]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("claude-sub-{}-{seq}.ndjson", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let Ok(mut f) = opts.open(&path) else {
+        return;
+    };
+    use std::io::Write;
+    for v in sent {
+        let _ = writeln!(f, "sent {}", serde_json::to_string(v).unwrap_or_default());
+    }
+    for v in lines {
+        let _ = writeln!(f, "recv {}", serde_json::to_string(v).unwrap_or_default());
+    }
 }
 
 fn tempfile_stage() -> Result<std::path::PathBuf, String> {
@@ -594,7 +706,15 @@ pub fn fold_lines(
                                     let input = b.get("input").cloned().unwrap_or(json!({}));
                                     let args = serde_json::to_string(&input)
                                         .unwrap_or_else(|_| "{}".into());
-                                    calls.push((id, short.to_string(), args));
+                                    // Partial snapshots can repeat a block;
+                                    // the last one carries the full input.
+                                    if let Some(existing) =
+                                        calls.iter_mut().find(|(eid, _, _)| *eid == id)
+                                    {
+                                        *existing = (id, short.to_string(), args);
+                                    } else {
+                                        calls.push((id, short.to_string(), args));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -611,12 +731,17 @@ pub fn fold_lines(
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // error_max_turns with emitted tool calls is the tool
+                // boundary (--max-turns 1), not a failure: the host runs the
+                // calls and the results return as replayed frames next turn.
                 if is_error && subtype != "success" {
-                    let detail = line
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .unwrap_or(subtype);
-                    return Err(format!("native request failed: {detail}"));
+                    if !(subtype == "error_max_turns" && !calls.is_empty()) {
+                        let detail = line
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .unwrap_or(subtype);
+                        return Err(format!("native request failed: {detail}"));
+                    }
                 }
                 for a in &natives {
                     let sr = a.get("stop_reason").and_then(Value::as_str).unwrap_or("");
@@ -628,6 +753,9 @@ pub fn fold_lines(
             }
             _ => {}
         }
+    }
+    if !calls.is_empty() && stop == "completed" {
+        stop = "tool_use".to_string();
     }
     // Finalize: one function_call + completed function_call_output per call,
     // reasoning carrier for the next turn, then response.completed.
@@ -648,6 +776,13 @@ pub fn fold_lines(
                 "item_id": format!("fc_{item_id}"), "call_id": id,
                 "name": name, "arguments": args}),
         );
+        emit(
+            &mut sse,
+            &json!({"type": "response.output_item.done",
+                "output_index": item_id - 1,
+                "item": {"type": "function_call", "id": format!("fc_{item_id}"),
+                    "call_id": id, "name": name, "arguments": args}}),
+        );
     }
     if !text.is_empty() {
         sse_text = text.clone();
@@ -661,6 +796,17 @@ pub fn fold_lines(
         );
     }
     if !natives.is_empty() {
+        // The host only attaches the encrypted carrier to history when the
+        // turn produced thinking text (thinking_block requires nonempty
+        // content). Feed it the native thinking as reasoning deltas so the
+        // carrier actually round-trips on replay.
+        if !thinking.is_empty() {
+            emit(
+                &mut sse,
+                &json!({"type": "response.reasoning_summary_text.delta",
+                    "output_index": item_id, "delta": thinking}),
+            );
+        }
         let blob = serde_json::to_string(&json!({"type": "claude-subscription-native",
             "version": 1, "messages": natives.clone(),
             "projection": {"content": text.trim(),
@@ -687,7 +833,6 @@ pub fn fold_lines(
                 "item": {"type": "reasoning", "id": "rs_native",
                     "summary": [], "encrypted_content": blob}}),
         );
-        let _ = thinking;
     }
     let usage_val = json!({"input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,

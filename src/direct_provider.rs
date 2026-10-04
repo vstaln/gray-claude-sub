@@ -634,14 +634,22 @@ fn feed_line(
                                 let input = b.get("input").cloned().unwrap_or(json!({}));
                                 let args =
                                     serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
-                                col.calls
-                                    .push((id.clone(), short.to_string(), args.clone()));
-                                out.push(StreamEvent::tool_call_delta(
-                                    col.calls.len() - 1,
-                                    Some(id),
-                                    Some(short.to_string()),
-                                    args,
-                                ));
+                                // Partial snapshots can repeat a block; the
+                                // last one carries the full input.
+                                if let Some(existing) =
+                                    col.calls.iter_mut().find(|(eid, _, _)| *eid == id)
+                                {
+                                    *existing = (id, short.to_string(), args);
+                                } else {
+                                    col.calls
+                                        .push((id.clone(), short.to_string(), args.clone()));
+                                    out.push(StreamEvent::tool_call_delta(
+                                        col.calls.len() - 1,
+                                        Some(id),
+                                        Some(short.to_string()),
+                                        args,
+                                    ));
+                                }
                             }
                             _ => {}
                         }
@@ -667,14 +675,17 @@ fn feed_line(
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if is_error && subtype != "success" {
+            // error_max_turns with emitted tool calls is the tool boundary
+            // (--max-turns 1), not a failure: the host runs the calls and the
+            // results return as replayed frames next turn.
+            if is_error
+                && subtype != "success"
+                && !(subtype == "error_max_turns" && !col.calls.is_empty())
+            {
                 let detail = line
                     .get("result")
                     .and_then(Value::as_str)
                     .unwrap_or(subtype);
-                // error_max_turns with tool calls is the tool boundary, not a
-                // failure — but this CLI has no --max-turns flag, so native
-                // never stops at one turn for us; treat any error result hard.
                 return Err(ProviderError::ServerError(format!(
                     "native request failed: {detail}"
                 )));
@@ -793,6 +804,10 @@ fn run_turn(
         String::new(),
         "--strict-mcp-config".into(),
         "--disable-slash-commands".into(),
+        // One turn: a tool_use ends the native run; the host executes the
+        // call and the result returns as a replayed frame next turn.
+        "--max-turns".into(),
+        "1".into(),
         "--permission-mode".into(),
         "dontAsk".into(),
         "--no-session-persistence".into(),
@@ -908,9 +923,10 @@ fn run_turn(
             )));
             return;
         }
-        if !ok {
-            // Nonzero exit with tool calls is the tool boundary only when the
-            // result said so; anything else is a native failure.
+        // Nonzero exit is the tool boundary only when the result said
+        // error_max_turns (--max-turns 1); anything else is a native failure.
+        let tool_boundary = col.stop == StopReason::ToolUse;
+        if !ok && !tool_boundary {
             let _ = tx.send(Err(ProviderError::ServerError(
                 "native request failed (nonzero exit without a success result)".into(),
             )));
