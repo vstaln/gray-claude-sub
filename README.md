@@ -12,7 +12,6 @@
 * **Single-Request Admission Relay**: Drives an internal request-scoped loopback admission relay that enforces exactly one upstream request per turn and absorbs redundant recovery attempts.
 * **Native Assistant Replay Carrier**: Assistant messages round-trip in signed reasoning replay carriers (`NATIVE_ITEM_ID`) so future turns restore byte-identical upstream frames without prompt divergence.
 * **Pinned Model Catalog**: Exact context windows without guessing (`opus`, `sonnet`, `fable`: 1,000,000 tokens; `haiku`: 200,000 tokens).
-* **Dual Integration**: Shipped as both a **standalone protocol-1.2 sidecar binary** (`claude-sub`) and an **in-process Rust provider library** (`claude_sub::direct_provider`).
 
 ---
 
@@ -119,7 +118,6 @@ The sidecar communicates over standard I/O using newline-delimited JSON (NDJSON)
 │   ├── models.rs            # Provider model metadata
 │   ├── manifest.rs          # Plugin protocol manifest
 │   ├── setup.rs             # CLI dependency discovery and verification
-│   └── direct_provider.rs   # In-process Provider trait implementation
 └── reference/               # Complete upstream Hermes DirectSDK test & eval suite
 ```
 
