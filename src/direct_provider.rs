@@ -309,8 +309,10 @@ pub(crate) fn prepare_turn(req: &ChatRequest, model: &str) -> Result<PreparedTur
                                 blocks.push(json!({"type": "image", "source": {
                                     "type": "base64", "media_type": media_type, "data": data}}));
                             }
-                            ContentBlock::Video { .. } => {
-                                return Err(crate::openai::video_rejected(model));
+                            ContentBlock::Media { .. } => {
+                                return Err(ProviderError::BadRequest(
+                                    "media input is unsupported by the Claude subscription funnel".into(),
+                                ));
                             }
                             ContentBlock::ToolUse { id, name, args } => {
                                 let input = if args.is_object() {
@@ -361,15 +363,17 @@ pub(crate) fn prepare_turn(req: &ChatRequest, model: &str) -> Result<PreparedTur
                             blocks.push(json!({"type": "image", "source": {
                                 "type": "base64", "media_type": media_type, "data": data}}));
                         }
-                        ContentBlock::Video { .. } => {
-                            return Err(crate::openai::video_rejected(model));
+                        ContentBlock::Media { .. } => {
+                            return Err(ProviderError::BadRequest(
+                                "media input is unsupported by the Claude subscription funnel".into(),
+                            ));
                         }
                         ContentBlock::ToolResult {
                             id,
                             content,
                             is_error,
                         } => {
-                            let text = crate::openai::wire_tool_output(content, *is_error);
+                            let text = content.clone();
                             let text = if text.is_empty() {
                                 "(no output)".to_string()
                             } else {
@@ -973,6 +977,6 @@ fn run_turn_sync(
     run_turn(provider, turn, req, effort)
 }
 
-#[path = "claude_subscription_tests.rs"]
+#[path = "direct_provider_tests.rs"]
 #[cfg(test)]
 mod tests;

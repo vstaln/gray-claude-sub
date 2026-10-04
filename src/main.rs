@@ -47,6 +47,11 @@ type Relays = relay::Intents;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
+    // `gray install plugin` registers sidecars by running `<bin> manifest`.
+    if std::env::args().nth(1).as_deref() == Some("manifest") {
+        println!("{}", serde_json::to_string(&manifest::manifest())?);
+        return Ok(());
+    }
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
