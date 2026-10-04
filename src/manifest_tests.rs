@@ -21,7 +21,7 @@ fn manifest_matches_protocol_12_contract() {
     assert_eq!(provider.id, PROVIDER_ID);
     let method = &provider.auth_methods[0];
     assert_eq!(method.id, AUTH_METHOD_ID);
-    assert_eq!(method.operations, vec!["models"]);
+    assert_eq!(method.operations, vec!["models", "chat"]);
     // Transport placeholder survives validation (rewritten per turn).
     provider
         .validate()
