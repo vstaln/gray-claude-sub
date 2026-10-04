@@ -817,6 +817,10 @@ fn run_turn(
             .env("DISABLE_AUTO_COMPACT", "1")
             .env("DISABLE_COMPACT", "1")
             .env("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off")
+        // A turn must never pop a browser out of a stale login.
+        .env("BROWSER", "/bin/true")
+        .env("DISPLAY", "")
+        .env("WAYLAND_DISPLAY", "")
             .spawn()
         {
             Ok(c) => c,

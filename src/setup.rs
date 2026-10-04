@@ -16,6 +16,85 @@ pub const INSTALL_HINT: &str = "`claude` not found on PATH. Install it with \
 pub const LOGIN_HINT: &str =
     "Claude Code is installed but not logged in. Run `claude auth login` and retry.";
 
+/// Login state. `Unknown` degrades to the pinned catalog, never to a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginState {
+    LoggedIn,
+    LoggedOut,
+    Unknown,
+}
+
+/// Probe login state with the CLI's own offline `auth status`.
+///
+/// `auth status` reads the local credential store (no network, no browser,
+/// no window) and reports `{"loggedIn": …}`: exit 0 parses the verdict,
+/// anything unexpected is `Unknown`. `CLAUDE_SUB_PROBE_TIMEOUT_SECS`
+/// overrides the default 15s (tests use 1s…5s).
+pub fn probe_login() -> LoginState {
+    let binary = match resolve_command() {
+        Some(b) => b,
+        None => return LoginState::Unknown,
+    };
+    if conflicting_env().is_some() {
+        return LoginState::Unknown;
+    }
+    let timeout_secs: u64 = std::env::var("CLAUDE_SUB_PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    let mut child = match std::process::Command::new(&binary)
+        .args(["auth", "status"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .envs(child_env())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return LoginState::Unknown,
+    };
+    let status = wait_timeout(&mut child, std::time::Duration::from_secs(timeout_secs));
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return LoginState::Unknown;
+    }
+    match status {
+        Some(Ok(s)) if s.success() => {
+            let mut out = String::new();
+            if let Some(mut stdout) = child.stdout.take()
+                && std::io::Read::read_to_string(&mut stdout, &mut out).is_ok()
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&out)
+                && value.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                return LoginState::LoggedIn;
+            }
+            LoginState::LoggedOut
+        }
+        Some(Ok(_)) => LoginState::LoggedOut,
+        _ => LoginState::Unknown,
+    }
+}
+
+fn wait_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(Ok(status)),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Some(Err(e)),
+        }
+    }
+}
+
 fn env_override() -> Option<String> {
     std::env::var("CLAUDE_SUB_COMMAND")
         .ok()

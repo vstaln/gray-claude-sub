@@ -107,12 +107,25 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             )?;
-            // External login: the CLI owns credentials; report where to fix it.
-            match setup::resolve_command() {
-                None => Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into())),
-                Some(_) => Err(ProviderRpcError::Unavailable(
+            // External login: the CLI owns credentials. Probe real login
+            // state (offline `auth status`, no browser); report where to fix it.
+            if setup::resolve_command().is_none() {
+                return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
+            }
+            if setup::conflicting_env().is_some() {
+                return Err(ProviderRpcError::Unavailable(
                     "Claude Code login lives in your terminal: run `claude auth login`, then retry.".into(),
-                )),
+                ));
+            }
+            // Sync probe, instant offline read; run inline (spawn_blocking
+            // needs 'static + Send, which the borrowed relays map blocks).
+            match setup::probe_login() {
+                setup::LoginState::LoggedIn => Ok(json!({"status": "authenticated"})),
+                setup::LoginState::LoggedOut | setup::LoginState::Unknown => {
+                    Err(ProviderRpcError::Unavailable(
+                        "Claude Code login lives in your terminal: run `claude auth login`, then retry.".into(),
+                    ))
+                }
             }
         }
         "provider/auth/poll" => Err(ProviderRpcError::Protocol(
