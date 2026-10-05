@@ -732,14 +732,15 @@ pub fn fold_lines(
                 // error_max_turns with emitted tool calls is the tool
                 // boundary (--max-turns 1), not a failure: the host runs the
                 // calls and the results return as replayed frames next turn.
-                if is_error && subtype != "success" {
-                    if !(subtype == "error_max_turns" && !calls.is_empty()) {
-                        let detail = line
-                            .get("result")
-                            .and_then(Value::as_str)
-                            .unwrap_or(subtype);
-                        return Err(format!("native request failed: {detail}"));
-                    }
+                if is_error
+                    && subtype != "success"
+                    && !(subtype == "error_max_turns" && !calls.is_empty())
+                {
+                    let detail = line
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .unwrap_or(subtype);
+                    return Err(format!("native request failed: {detail}"));
                 }
                 for a in &natives {
                     let sr = a.get("stop_reason").and_then(Value::as_str).unwrap_or("");
