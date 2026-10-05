@@ -233,13 +233,20 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
         .cloned()
         .unwrap_or_default();
     let extra = crate::chat::extra_body(&turn.names, &tools);
+    // The effort rides inside the POST body's `reasoning` object —
+    // `provider/chat` params have no effort field.
+    let effort = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str)
+        .or(intent.effort.as_deref());
     // History frames replay first (no-query each), the final frame queries:
     // native makes exactly one upstream request on its own.
     let lines = crate::chat::spawn_turn(
         &turn,
         &extra,
         &turn.system.clone(),
-        intent.effort.as_deref(),
+        effort,
         Duration::from_secs(300),
     )?;
     let names: Vec<String> = tools
