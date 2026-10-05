@@ -732,14 +732,15 @@ pub fn fold_lines(
                 // error_max_turns with emitted tool calls is the tool
                 // boundary (--max-turns 1), not a failure: the host runs the
                 // calls and the results return as replayed frames next turn.
-                if is_error && subtype != "success" {
-                    if !(subtype == "error_max_turns" && !calls.is_empty()) {
-                        let detail = line
-                            .get("result")
-                            .and_then(Value::as_str)
-                            .unwrap_or(subtype);
-                        return Err(format!("native request failed: {detail}"));
-                    }
+                if is_error
+                    && subtype != "success"
+                    && !(subtype == "error_max_turns" && !calls.is_empty())
+                {
+                    let detail = line
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .unwrap_or(subtype);
+                    return Err(format!("native request failed: {detail}"));
                 }
                 for a in &natives {
                     let sr = a.get("stop_reason").and_then(Value::as_str).unwrap_or("");
@@ -835,7 +836,8 @@ pub fn fold_lines(
     let usage_val = json!({"input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
-        "input_tokens_details": {"cached_tokens": usage.cached_tokens}});
+        "input_tokens_details": {"cached_tokens": usage.cached_tokens,
+            "cache_creation_tokens": usage.cache_write_tokens}});
     emit(
         &mut sse,
         &json!({"type": "response.completed",
@@ -852,6 +854,8 @@ pub struct Usage {
     pub output_tokens: usize,
     /// `cache_read_input_tokens` — a subset of `input_tokens`.
     pub cached_tokens: usize,
+    /// `cache_creation_input_tokens` — a subset of `input_tokens`.
+    pub cache_write_tokens: usize,
 }
 
 pub fn map_usage(u: &Value) -> Usage {
@@ -869,6 +873,7 @@ pub fn map_usage(u: &Value) -> Usage {
         input_tokens: input.saturating_add(read).saturating_add(write),
         output_tokens: output,
         cached_tokens: read,
+        cache_write_tokens: write,
     }
 }
 

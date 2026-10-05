@@ -93,6 +93,25 @@ fn carrier_restores_thinking_on_tool_use_replay() {
 }
 
 #[test]
+fn usage_reports_cache_reads_and_writes() {
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "hello"}]}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 4, "output_tokens": 3,
+                "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (sse, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.input_tokens, 154);
+    assert_eq!(usage.cached_tokens, 100);
+    assert_eq!(usage.cache_write_tokens, 50);
+    let s = String::from_utf8(sse).unwrap();
+    assert!(s.contains("\"cached_tokens\":100"));
+    assert!(s.contains("\"cache_creation_tokens\":50"));
+}
+
+#[test]
 fn fold_emits_valid_responses_sse() {
     let lines = vec![
         json!({"type": "assistant", "message": {"role": "assistant",
