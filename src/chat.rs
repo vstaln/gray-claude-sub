@@ -388,9 +388,7 @@ fn restore_carriers(input: &[Value], frames: &mut Vec<Value>, model: &str) {
         let saved = &carriers[ci];
         let mut got: Vec<String> = Vec::new();
         let mut run = 0;
-        while next_saved[ci] + run < saved.len()
-            && has_tool_use(&saved[next_saved[ci] + run])
-        {
+        while next_saved[ci] + run < saved.len() && has_tool_use(&saved[next_saved[ci] + run]) {
             got.extend(block_ids(&saved[next_saved[ci] + run]));
             run += 1;
             if got == ids {
@@ -836,7 +834,8 @@ pub fn fold_lines(
     }
     let usage_val = json!({"input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
-        "total_tokens": usage.input_tokens + usage.output_tokens});
+        "total_tokens": usage.input_tokens + usage.output_tokens,
+        "input_tokens_details": {"cached_tokens": usage.cached_tokens}});
     emit(
         &mut sse,
         &json!({"type": "response.completed",
@@ -851,6 +850,8 @@ pub fn fold_lines(
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// `cache_read_input_tokens` — a subset of `input_tokens`.
+    pub cached_tokens: usize,
 }
 
 pub fn map_usage(u: &Value) -> Usage {
@@ -867,6 +868,7 @@ pub fn map_usage(u: &Value) -> Usage {
     Usage {
         input_tokens: input.saturating_add(read).saturating_add(write),
         output_tokens: output,
+        cached_tokens: read,
     }
 }
 
