@@ -835,7 +835,8 @@ pub fn fold_lines(
     let usage_val = json!({"input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
-        "input_tokens_details": {"cached_tokens": usage.cached_tokens}});
+        "input_tokens_details": {"cached_tokens": usage.cached_tokens,
+            "cache_creation_tokens": usage.cache_write_tokens}});
     emit(
         &mut sse,
         &json!({"type": "response.completed",
@@ -852,6 +853,8 @@ pub struct Usage {
     pub output_tokens: usize,
     /// `cache_read_input_tokens` — a subset of `input_tokens`.
     pub cached_tokens: usize,
+    /// `cache_creation_input_tokens` — a subset of `input_tokens`.
+    pub cache_write_tokens: usize,
 }
 
 pub fn map_usage(u: &Value) -> Usage {
@@ -869,6 +872,7 @@ pub fn map_usage(u: &Value) -> Usage {
         input_tokens: input.saturating_add(read).saturating_add(write),
         output_tokens: output,
         cached_tokens: read,
+        cache_write_tokens: write,
     }
 }
 
