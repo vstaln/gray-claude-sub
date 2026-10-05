@@ -83,14 +83,32 @@ pub fn all_ids() -> Vec<String> {
     out
 }
 
-/// Display name for a route id.
+/// Display name for a route id. `5-5` in an id is `5.5` upstream: a lone
+/// digit folds onto a digit-ending word (`haiku-4-5-20251001` keeps its
+/// date — six-plus digits never merge).
 pub fn display_name(id: &str) -> String {
     let base = id.strip_suffix("[1m]").unwrap_or(id);
     let canon = canonical(base);
-    let short = canon
-        .strip_prefix("claude-")
-        .unwrap_or(canon)
-        .replace('-', " ");
+    let short = canon.strip_prefix("claude-").unwrap_or(canon);
+    let mut words: Vec<String> = Vec::new();
+    for w in short.split('-') {
+        let lone_digit = w.len() == 1 && w.bytes().next().is_some_and(|b| b.is_ascii_digit());
+        if lone_digit
+            && words
+                .last()
+                .is_some_and(|p: &String| p.ends_with(|c: char| c.is_ascii_digit()))
+        {
+            words.last_mut().unwrap().push('.');
+            words.last_mut().unwrap().push_str(w);
+            continue;
+        }
+        let mut c = w.chars();
+        words.push(match c.next() {
+            Some(f) => f.to_uppercase().chain(c).collect(),
+            None => String::new(),
+        });
+    }
+    let short = words.join(" ");
     if id.ends_with("[1m]") {
         format!("Claude {short} 1M")
     } else {

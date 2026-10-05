@@ -17,6 +17,15 @@ fn haiku_rejects_1m() {
 }
 
 #[test]
+fn display_name_restores_version_dots() {
+    assert_eq!(display_name("opus"), "Claude Opus 5.5");
+    assert_eq!(display_name("claude-opus-5-5[1m]"), "Claude Opus 5.5 1M");
+    assert_eq!(display_name("haiku"), "Claude Haiku 4.5 20251001");
+    assert_eq!(display_name("claude-sonnet-5"), "Claude Sonnet 5");
+    assert_eq!(display_name("claude-fable-5-1"), "Claude Fable 5.1");
+}
+
+#[test]
 fn catalog_covers_aliases_and_bare_ids() {
     let ids = all_ids();
     for want in ["sonnet", "opus", "haiku", "fable", "claude-sonnet-5[1m]"] {
