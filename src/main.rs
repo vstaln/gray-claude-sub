@@ -195,6 +195,21 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
             "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
         )));
     }
+    // No login, no relay: `/connect` shows the hint instead of a turn that
+    // dies later. A confirmed login is remembered for this sidecar's life;
+    // an inconclusive probe never blocks a turn.
+    static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
+        match setup::probe_login() {
+            setup::LoginState::LoggedOut => {
+                return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
+            }
+            setup::LoginState::LoggedIn => {
+                LOGGED_IN.store(true, std::sync::atomic::Ordering::Relaxed)
+            }
+            setup::LoginState::Unknown => {}
+        }
+    }
     let bearer = format!("claude-sub-{}", hex_id());
     // The relay server is per-turn: bind now so the host gets a live port.
     // The admitted POST carries the Responses body; the handler translates,
