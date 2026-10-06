@@ -573,7 +573,11 @@ fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
     let tool_boundary = lines.iter().any(|v| {
         is(v, "result") && v.get("subtype").and_then(Value::as_str) == Some("error_max_turns")
     });
-    if !exit_ok && !tool_boundary {
+    // An upstream rejection (subscription limit, overload, auth) is a
+    // rejection whatever the process exit code: the result carries the API
+    // status and the native sentence, and must never degrade to NO_ANSWER —
+    // that reads as a refused resume and would replay the burned request.
+    if !tool_boundary {
         let api = lines.iter().rev().find_map(|v| {
             is(v, "result")
                 .then(|| v.get("api_error_status").and_then(Value::as_u64))
@@ -595,6 +599,7 @@ fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
 
 /// `keepalive` marks cache-keepalive probes ([`crate::keepalive`]) in the
 /// debug dump only; the spawn itself is identical either way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_native(
     turn: &PreparedTurn,
     extra: &Value,
@@ -833,14 +838,32 @@ fn read_lines(
     timeout: std::time::Duration,
 ) -> Result<Vec<Value>, String> {
     use std::io::BufRead;
-    let reader = std::io::BufReader::new(stdout);
-    let mut out = Vec::new();
-    let start = std::time::Instant::now();
-    for line in reader.lines() {
-        if start.elapsed() > timeout {
-            return Err("Claude request timed out".into());
+    // Lines arrive over a channel so the deadline is real: `BufRead::lines`
+    // blocks between lines, and a silent child (sitting out a usage-limit
+    // window, stuck in its own retry loop) would otherwise park the turn
+    // forever — the old per-line check only fired when a line arrived. On
+    // timeout the caller kills the child; the reader thread then sees EOF.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            if tx.send(line).is_err() {
+                return;
+            }
         }
-        let line = line.map_err(|e| format!("native stdout: {e}"))?;
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut out = Vec::new();
+    loop {
+        let line =
+            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(Ok(line)) => line,
+                Ok(Err(e)) => return Err(format!("native stdout: {e}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("Claude request timed out".into());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -851,9 +874,50 @@ fn read_lines(
                 line.chars().take(300).collect::<String>()
             )
         })?;
+        // A rejected rate-limit event means the CLI stopped answering and
+        // is sitting out its window: surface the reset now instead of
+        // parking the turn until the child gives up (or the deadline).
+        if let Some(msg) = rate_limit_rejection(&v) {
+            return Err(msg);
+        }
         out.push(v);
     }
     Ok(out)
+}
+
+/// A `rate_limit_event` that means the CLI is waiting out its window, not
+/// answering: `{"status": "rejected", "resetsAt", "rateLimitType"}`.
+/// `allowed`/`allowed_warning` pass through; an unknown status doesn't
+/// qualify (the run's own result line judges it at the end). Shaped like
+/// an [`API_ERROR`] so the relay reports the 429, not a generic failure.
+fn rate_limit_rejection(v: &Value) -> Option<String> {
+    if v.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+        return None;
+    }
+    let info = v.get("rate_limit_info")?;
+    if info.get("status").and_then(Value::as_str) != Some("rejected") {
+        return None;
+    }
+    let kind = info
+        .get("rateLimitType")
+        .and_then(Value::as_str)
+        .unwrap_or("rate limit");
+    let reset = info
+        .get("resetsAt")
+        .and_then(Value::as_u64)
+        .and_then(|t| {
+            t.checked_sub(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_secs(),
+            )
+        })
+        .map(|secs| format!("resets in ~{}m", (secs / 60).max(1)))
+        .unwrap_or_else(|| "reset imminent".to_string());
+    Some(format!(
+        "{API_ERROR}429: Claude usage limit reached ({kind}) · {reset}"
+    ))
 }
 
 /// Fold native stream-json lines into a Responses SSE stream.
@@ -875,7 +939,6 @@ pub fn fold_lines(
     String,
 > {
     let mut text = String::new();
-    let mut thinking = String::new();
     let mut calls: Vec<(String, String, String)> = Vec::new();
     let mut natives: Vec<Value> = Vec::new();
     let mut usage = Usage::default();
@@ -931,11 +994,11 @@ pub fn fold_lines(
                                         text.push_str(t);
                                     }
                                 }
-                                Some("thinking") => {
-                                    if let Some(t) = b.get("thinking").and_then(Value::as_str) {
-                                        thinking.push_str(t);
-                                    }
-                                }
+                                // Thinking stays inside the native carrier:
+                                // Claude surfaces no reasoning traces, so
+                                // the host must not either. The signed blocks
+                                // still round-trip for replay via `natives`.
+                                Some("thinking") => {}
                                 Some("tool_use") => {
                                     let id = b
                                         .get("id")
@@ -1047,17 +1110,6 @@ pub fn fold_lines(
         );
     }
     if !natives.is_empty() {
-        // The host only attaches the encrypted carrier to history when the
-        // turn produced thinking text (thinking_block requires nonempty
-        // content). Feed it the native thinking as reasoning deltas so the
-        // carrier actually round-trips on replay.
-        if !thinking.is_empty() {
-            emit(
-                &mut sse,
-                &json!({"type": "response.reasoning_summary_text.delta",
-                    "output_index": item_id, "delta": thinking}),
-            );
-        }
         let blob = serde_json::to_string(&json!({"type": "claude-subscription-native",
             "version": 1, "messages": natives.clone(),
             "projection": {"content": text.trim(),

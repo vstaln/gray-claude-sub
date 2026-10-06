@@ -173,30 +173,29 @@ fn handle_conn(
             let _ = s.flush();
         }
         Ok(Err(detail)) => {
-            let (status, kind, msg) = match crate::chat::api_error(&detail) {
-                Some((429, msg)) => (429, "rate_limit_error", msg),
-                Some((code, msg)) => (code, "api_error", msg),
-                None => (500, "server_error", detail.as_str()),
-            };
-            let body = json!({"type": "error", "error": {"type": kind, "message": msg}});
-            write_resp(s, status, body.to_string().as_bytes());
+            // Terminal auth verdicts stay HTTP: the host maps 401/403
+            // straight to an auth error — no retry is coming, so the
+            // message lands as-is.
+            if let Some((code @ (401 | 403), msg)) = crate::chat::api_error(&detail) {
+                let body = json!({"type": "error", "error": {
+                    "type": "authentication_error", "message": msg}});
+                write_resp(s, code, body.to_string().as_bytes());
+                return;
+            }
+            if !write_sse_head(s) {
+                return;
+            }
+            write_sse_failure(s, &detail);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let body = json!({"type": "error", "error": {
-                "type": "server_error", "message": "turn worker died",
-            }});
-            write_resp(s, 500, body.to_string().as_bytes());
+            if write_sse_head(s) {
+                write_sse_failure(s, "turn worker died");
+            }
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // Slow turn: no Content-Length, the stream ends at close.
             // eventsource-stream ignores `:` comment lines.
-            if s
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-                )
-                .and_then(|_| s.flush())
-                .is_err()
-            {
+            if !write_sse_head(s) {
                 return;
             }
             loop {
@@ -207,12 +206,7 @@ fn handle_conn(
                         return;
                     }
                     Ok(Err(detail)) => {
-                        let failed = json!({"type": "response.failed",
-                            "response": {"status": "failed",
-                                "error": {"code": "server_error", "message": detail}}});
-                        let _ =
-                            s.write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes());
-                        let _ = s.flush();
+                        write_sse_failure(s, &detail);
                         return;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -271,6 +265,31 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
     let (sse, _, _, _, _, _) = crate::chat::fold_lines(&lines, &names, &say)?;
     Ok(sse)
+}
+
+/// Headers for a close-delimited SSE response (no Content-Length — the
+/// stream ends at connection close).
+fn write_sse_head(s: &mut std::net::TcpStream) -> bool {
+    s.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+    )
+    .and_then(|_| s.flush())
+    .is_ok()
+}
+
+/// Turn failure as an SSE `response.failed` frame. A retryable HTTP
+/// status would only be re-POSTed into the consumed admission —
+/// surfacing ADMISSION_CONSUMED instead of the real failure — so turn
+/// errors (limits, timeouts, spawn failures) ride the stream; the
+/// host's turn-level retry re-enters through `provider/chat` → a fresh
+/// relay. Caller writes the head first if the stream isn't open yet.
+fn write_sse_failure(s: &mut std::net::TcpStream, detail: &str) {
+    let failed = json!({"type": "response.failed",
+        "response": {"status": "failed",
+            "error": {"code": "server_error", "message": detail}}});
+    let _ = s
+        .write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes())
+        .and_then(|_| s.flush());
 }
 
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
