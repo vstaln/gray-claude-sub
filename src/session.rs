@@ -239,6 +239,19 @@ fn session_file(sid: &str) -> Option<PathBuf> {
     Some(projects_root()?.join(name).join(format!("{sid}.jsonl")))
 }
 
+/// Delete a throwaway session we created (a keepalive probe's fork): its
+/// transcript, its sidecar directory and its ledger entry. Best-effort.
+pub fn discard(sid: &str) {
+    if !is_uuid(sid) {
+        return;
+    }
+    if let Some(path) = session_file(sid) {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.with_extension(""));
+    }
+    let _ = std::fs::remove_file(cache_root().join("sessions").join(sid));
+}
+
 /// Make session `sid` safe to resume: drop native's own tool executions.
 ///
 /// With `--max-turns 1` native still tries each tool_use before stopping —

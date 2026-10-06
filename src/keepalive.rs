@@ -12,17 +12,23 @@
 //! — resumed at the same point with a throwaway prompt. The upstream read
 //! renews the TTL.
 //!
-//! The probe's exchange appends under the resume point in the native
-//! session file. That is safe: `--resume-session-at` truncates the loaded
-//! transcript at the stored uuid, so the probe branch never reaches a real
-//! turn's context (branching under an interior uuid is exactly what the
-//! next real turn, and the rewind feature, do anyway). The resume point
-//! itself is never rewritten — the probe does not call `session::save`.
+//! The probe never writes into the real session: it resumes with
+//! `--fork-session` into a throwaway session id, deleted afterwards. Native
+//! resolves `--resume-session-at` only along the chain ending at the
+//! session's newest entry, so a probe branch appended to the real file made
+//! the stored point unreachable ("No message found with message.uuid") and
+//! the next real turn fell back to a cold synthetic transcript. The prompt
+//! cache keys on request content, not session id, so the fork warms the
+//! same entry. The resume point itself is never rewritten — the probe does
+//! not call `session::save`.
 //!
-//! Bounds: a key is warmed only while its last real turn is younger than
-//! [`WARM_WINDOW`] (each probe costs one cache-read of the full prefix plus
-//! a spawn), the sweeper is a single thread that claims a key under the
-//! lock before spawning so a key never has two probes in flight, and
+//! Bounds: one entry per conversation — a turn's point supersedes the one
+//! it resumed from (and any older point in the same native session), so
+//! only the latest point is ever probed. A key is warmed only while its
+//! last real turn is younger than [`WARM_WINDOW`] (each probe costs one
+//! cache-read of the full prefix plus a spawn), the sweeper is a single
+//! thread that claims a key under the lock before spawning so a key never
+//! has two probes in flight, and
 //! [`MAX_FAILURES`] consecutive failures — or a refused resume, which means
 //! the point is dead — stop the warming. A probe counts as upstream
 //! contact win or lose, so a persistent failure retries after
@@ -94,9 +100,12 @@ fn registry() -> &'static Mutex<HashMap<u64, Warm>> {
 
 /// A real turn finished and left a resume point: (re)start warming the
 /// conversation. Called from [`crate::chat::spawn_turn`] right after the
-/// point is saved; the key is the same one the next turn looks up.
+/// point is saved; the key is the same one the next turn looks up. `prev`
+/// is the key this turn resumed from: it and every other point in the same
+/// native session are superseded, so only the latest point stays warm.
 pub fn note_turn(
     key: u64,
+    prev: Option<u64>,
     point: ResumePoint,
     turn: &PreparedTurn,
     system: &str,
@@ -117,7 +126,16 @@ pub fn note_turn(
         last_contact: now,
         failures: 0,
     };
-    let _ = registry().lock().map(|mut m| m.insert(key, warm));
+    let _ = registry()
+        .lock()
+        .map(|mut m| supersede(&mut m, key, prev, warm));
+}
+
+/// Insert `warm` under `key`, dropping the entries it replaces: `prev` and
+/// any other point in the same native session.
+fn supersede(map: &mut HashMap<u64, Warm>, key: u64, prev: Option<u64>, warm: Warm) {
+    map.retain(|k, w| Some(*k) != prev && w.point.0 != warm.point.0);
+    map.insert(key, warm);
 }
 
 /// Whether a key wants a probe now: upstream contact old enough to need
@@ -192,9 +210,10 @@ fn finish(key: u64, err: Option<&str>) {
     }
 }
 
-/// One probe: resume the stored session at the stored point and re-issue
-/// the real turn's request shape with the throwaway prompt. The single
-/// sweeper thread runs this inline, so keys refresh serially and never
+/// One probe: resume the stored session at the stored point — forked into
+/// a throwaway session, so the real one is untouched — and re-issue the
+/// real turn's request shape with the throwaway prompt. The single sweeper
+/// thread runs this inline, so keys refresh serially and never
 /// concurrently with themselves.
 fn refresh(key: u64) {
     let Some((point, probe)) = claim(key) else {
@@ -206,7 +225,8 @@ fn refresh(key: u64) {
         names: Vec::new(),
         native_model: probe.model.clone(),
     };
-    match chat::run_native(
+    let fork = session::new_uuid();
+    let result = chat::run_native(
         &turn,
         &probe.extra,
         &probe.system,
@@ -214,16 +234,10 @@ fn refresh(key: u64) {
         PROBE_TIMEOUT,
         &turn.frames,
         Some(&point),
-        true,
-    ) {
-        Ok(_) => {
-            // If the probe ended on the tool boundary, native recorded its
-            // own error results; drop them like a real turn would.
-            session::prune_native_tool_results(&point.0);
-            finish(key, None);
-        }
-        Err(e) => finish(key, Some(&e)),
-    }
+        Some(&fork),
+    );
+    session::discard(&fork);
+    finish(key, result.err().as_deref());
 }
 
 fn run() {
