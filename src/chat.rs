@@ -478,12 +478,16 @@ pub fn spawn_turn(
         .rposition(|f| f.get("type").and_then(Value::as_str) == Some("assistant"))
         .map_or(0, |i| i + 1);
     let run = |frames: &[Value], at: Option<&ResumePoint>| {
-        run_native(turn, extra, system, effort, timeout, frames, at, false)
+        run_native(turn, extra, system, effort, timeout, frames, at, None)
     };
     let mut lines = None;
-    if split > 0 {
-        let (history, tail) = frames.split_at(split);
-        let stored = || session::lookup(resume_key(turn, system, history));
+    // The key the previous turn of this conversation saved under: once this
+    // turn records its own point, that one is superseded.
+    let prev_key = (split > 0).then(|| resume_key(turn, system, &frames[..split]));
+    if let Some(prev) = prev_key {
+        let tail = &frames[split..];
+        let stored = || session::lookup(prev);
+        let history = &frames[..split];
         let synthetic = || session::synthesize(history);
         for at in [&stored as &dyn Fn() -> Option<ResumePoint>, &synthetic] {
             let Some(at) = at() else { continue };
@@ -516,7 +520,7 @@ pub fn spawn_turn(
         session::save(key, &sid, &uuid);
         // Warm the cache entry the next turn will resume into (see
         // keepalive): same key, same point, same request shape.
-        crate::keepalive::note_turn(key, (sid, uuid), turn, system, extra, effort);
+        crate::keepalive::note_turn(key, prev_key, (sid, uuid), turn, system, extra, effort);
     }
     Ok(lines)
 }
@@ -597,8 +601,9 @@ fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `keepalive` marks cache-keepalive probes ([`crate::keepalive`]) in the
-/// debug dump only; the spawn itself is identical either way.
+/// `fork` resumes into a new session with that id instead of appending to
+/// the resumed one (`--fork-session`): cache-keepalive probes
+/// ([`crate::keepalive`]) use it so the real session's leaf never moves.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_native(
     turn: &PreparedTurn,
@@ -608,7 +613,7 @@ pub(crate) fn run_native(
     timeout: std::time::Duration,
     frames: &[Value],
     resume: Option<&ResumePoint>,
-    keepalive: bool,
+    fork: Option<&str>,
 ) -> Result<Vec<Value>, String> {
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let extra_s = extra.to_string();
@@ -658,6 +663,13 @@ pub(crate) fn run_native(
             "--resume-session-at".into(),
             uuid.clone(),
         ]);
+        if let Some(new_sid) = fork {
+            argv.extend([
+                "--fork-session".into(),
+                "--session-id".into(),
+                new_sid.to_string(),
+            ]);
+        }
     }
     if let Some(e) = effort.filter(|e| *e != "off") {
         argv.push("--effort".into());
@@ -684,8 +696,8 @@ pub(crate) fn run_native(
     let mut sent: Vec<Value> = Vec::new();
     let mut stdin_closed = false;
     if debug {
-        if keepalive {
-            sent.push(json!({"keepalive": true}));
+        if let Some(new_sid) = fork {
+            sent.push(json!({"keepalive": true, "fork": new_sid}));
         }
         if let Some((sid, uuid)) = resume {
             sent.push(json!({"resume": sid, "at": uuid}));

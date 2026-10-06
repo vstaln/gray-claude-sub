@@ -56,6 +56,41 @@ fn plan_drops_dead_and_foreign_keys_and_returns_due_sorted() {
 }
 
 #[test]
+fn a_turn_supersedes_its_predecessor_and_older_points_in_its_session() {
+    let cwd = PathBuf::from("/w");
+    let in_session = |sid: &str| {
+        let mut w = warm(MIN, MIN, &cwd);
+        w.point.0 = sid.into();
+        w
+    };
+    let (sid_a, sid_b, sid_c) = (
+        "aaaaaaaa-0000-4000-8000-000000000000",
+        "bbbbbbbb-0000-4000-8000-000000000000",
+        "cccccccc-0000-4000-8000-000000000000",
+    );
+    let mut map = HashMap::new();
+    // Every round of one conversation used to stay registered, so each old
+    // point got probed 50 minutes later: only the newest may survive.
+    map.insert(1, in_session(sid_a));
+    map.insert(2, in_session(sid_a));
+    // The predecessor lives in another session (a synthetic fallback).
+    map.insert(3, in_session(sid_b));
+    // An unrelated conversation is untouched.
+    map.insert(4, in_session(sid_c));
+
+    supersede(&mut map, 5, Some(3), in_session(sid_a));
+    let mut keys: Vec<u64> = map.keys().copied().collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec![4, 5]);
+
+    // First turn of a conversation: nothing to supersede by key.
+    supersede(&mut map, 6, None, in_session(sid_b));
+    let mut keys: Vec<u64> = map.keys().copied().collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec![4, 5, 6]);
+}
+
+#[test]
 fn claim_is_single_shot_and_rechecks_under_lock() {
     let cwd = std::env::current_dir().unwrap();
     // Unique keys: the registry is shared across tests in this binary.
