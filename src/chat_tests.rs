@@ -349,6 +349,73 @@ fn result(extra: Value) -> Value {
 }
 
 #[test]
+fn fold_emits_carrier_without_reasoning_deltas() {
+    // Claude surfaces no reasoning traces: thinking stays inside the
+    // native carrier — no reasoning_summary_text.delta — while the
+    // encrypted carrier item still reaches the host for replay.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "s"},
+                {"type": "text", "text": "hi"}]}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 1, "output_tokens": 1}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (sse, _, _, _, _, _) = fold_lines(&lines, &[], &say).unwrap();
+    let s = String::from_utf8(sse).unwrap();
+    assert!(!s.contains("reasoning_summary_text"), "{s}");
+    assert!(s.contains("\"type\":\"reasoning\""), "{s}");
+    assert!(s.contains("encrypted_content"), "{s}");
+}
+
+#[test]
+fn rejected_rate_limit_event_fails_fast() {
+    let rejected = json!({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "rateLimitType": "five_hour", "resetsAt": 1}});
+    let e = rate_limit_rejection(&rejected).unwrap();
+    assert!(e.starts_with(API_ERROR), "{e}");
+    assert_eq!(api_error(&e).map(|(c, _)| c), Some(429));
+    for status in ["allowed", "allowed_warning", "mystery"] {
+        let ev = json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": status, "rateLimitType": "five_hour"}});
+        assert!(rate_limit_rejection(&ev).is_none(), "{status}");
+    }
+    assert!(rate_limit_rejection(&json!({"type": "assistant"})).is_none());
+}
+
+#[test]
+fn read_lines_times_out_on_a_silent_child() {
+    // A child that never prints and never exits must hit the deadline:
+    // before the channel-based read, the clock was only re-checked when
+    // a line arrived, so a silent runaway parked the turn forever.
+    let mut child = std::process::Command::new("sleep")
+        .arg("2")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let e = read_lines(stdout, std::time::Duration::from_millis(50)).unwrap_err();
+    assert_eq!(e, "Claude request timed out");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn judge_honors_api_rejection_on_clean_exit() {
+    // A rejected request is a rejection even when the CLI exits 0: it
+    // must never degrade to NO_ANSWER (that reads as a refused resume
+    // and would replay the already-spent request).
+    let limited = vec![
+        answer("<synthetic>"),
+        result(json!({"is_error": true, "api_error_status": 429,
+            "result": "limit"})),
+    ];
+    let e = judge(&limited, true).unwrap_err();
+    assert_eq!(api_error(&e).map(|(c, _)| c), Some(429));
+}
+
+#[test]
 fn refused_resume_moves_on_but_rate_limit_does_not() {
     // `--resume` of a pruned session / unknown uuid (claude 2.1.285):
     // exit 1, one error_during_execution result, no assistant, no request.
