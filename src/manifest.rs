@@ -6,7 +6,7 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "claude-sub";
-pub const PLUGIN_VERSION: &str = "0.1.0";
+pub const PLUGIN_VERSION: &str = "0.1.2";
 pub const PROVIDER_ID: &str = "claude-subscription";
 pub const AUTH_METHOD_ID: &str = "claude-login";
 
