@@ -15,7 +15,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use claude_sub::{catalog, manifest, models, relay, setup};
+use claude_sub::{catalog, keepalive, manifest, models, relay, setup};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
+    // Re-warm resumed sessions before their ~1h prompt-cache entry lapses.
+    keepalive::start();
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
     let mut stdout = std::io::stdout();

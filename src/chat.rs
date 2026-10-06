@@ -2,8 +2,9 @@
 //! `Client.chat.completions.create` flow
 //! (NousResearch/hermes-plugin-claude-subscription-directsdk, MIT):
 //!
-//! history frames replay first (`shouldQuery: false`, zero-turn ack each),
-//! the final user/tool-result frame queries. Native answers with exactly one
+//! history loads into a resumed native session (see [`spawn_turn`]; stdin
+//! `shouldQuery: false` replay is only the last resort), the final
+//! user/tool-result frame queries. Native answers with exactly one
 //! upstream request (the admission relay enforces it); gray owns tools,
 //! approvals and compaction — Claude only answers.
 //!
@@ -18,6 +19,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use crate::session::{self, ResumePoint};
 use crate::setup;
 
 /// Tool-name prefix native sees (host names restored on the way back).
@@ -82,6 +84,21 @@ fn text_of(blocks: &Value) -> String {
             .join(""),
         _ => String::new(),
     }
+}
+
+/// Anthropic image blocks for the `input_image` data-URL parts in `blocks`.
+fn images_of(blocks: &Value) -> Vec<Value> {
+    let Value::Array(arr) = blocks else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("input_image"))
+        .filter_map(|b| b.get("image_url").and_then(Value::as_str))
+        .filter_map(|u| u.strip_prefix("data:")?.split_once(";base64,"))
+        .map(|(mt, data)| {
+            json!({"type": "image", "source": {"type": "base64", "media_type": mt, "data": data}})
+        })
+        .collect()
 }
 
 /// Kind of a Responses input item: the `type` field, or "message" for the
@@ -188,6 +205,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                     if !text.is_empty() {
                         blocks.push(json!({"type": "text", "text": text}));
                     }
+                    blocks.extend(images_of(&content));
                     if blocks.is_empty() {
                         continue;
                     }
@@ -197,6 +215,21 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                             .pointer_mut("/message/content")
                             .and_then(Value::as_array_mut)
                     {
+                        // The host sends a tool's image as a separate user
+                        // item right after its output: fold it into that
+                        // tool_result so the model sees it as the tool's.
+                        if text.is_empty()
+                            && let Some(tr) = arr.last_mut()
+                            && tr.get("type").and_then(Value::as_str) == Some("tool_result")
+                        {
+                            if let Some(t) = tr["content"].as_str() {
+                                tr["content"] = json!([{"type": "text", "text": t}]);
+                            }
+                            if let Some(parts) = tr["content"].as_array_mut() {
+                                parts.extend(blocks);
+                                continue;
+                            }
+                        }
                         arr.extend(blocks);
                         continue;
                     }
@@ -287,11 +320,12 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     })
 }
 
-fn restore_carriers(input: &[Value], frames: &mut Vec<Value>, model: &str) {
-    // Collect our own carriers in order: each is one turn's saved native
-    // assistant messages. A carrier's tool_use ids are the host's call_ids,
-    // so re-derived frames and saved messages join on ids the host owns.
-    let mut carriers: Vec<Vec<Value>> = Vec::new();
+fn restore_carriers(input: &[Value], frames: &mut [Value], model: &str) {
+    // Our own carriers, in order: each holds one turn's native assistant
+    // messages. Partial-message mode emits one line per content block
+    // (thinking, text, tool_use…) under the same message id, so merge them
+    // back into whole messages before matching.
+    let mut pool: Vec<Value> = Vec::new();
     for item in input {
         if item_kind(item) != "reasoning" {
             continue;
@@ -316,95 +350,82 @@ fn restore_carriers(input: &[Value], frames: &mut Vec<Value>, model: &str) {
         // Same-model gate lives in the host (thinking_block stamps it); the
         // relay trusts the host to only send back what it stamped.
         let _ = model;
-        if let Some(saved) = saved {
-            carriers.push(saved);
-        }
+        pool.extend(merge_partials(saved.unwrap_or_default()));
     }
-    if carriers.is_empty() {
+    if pool.is_empty() {
         return;
     }
-    let block_ids = |m: &Value| -> Vec<String> {
-        m.get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
-                    .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let has_tool_use = |m: &Value| !block_ids(m).is_empty();
-    let is_text_only = |f: &Value| {
-        f.pointer("/message/content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .all(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            })
-    };
-    // Rebuild: carriers map positionally onto re-derived assistant frames,
-    // one turn's frames per carrier. Text-only frames take the carrier's
-    // text message; tool_use frames take the native messages covering the
-    // same call ids — this restores the signed thinking blocks Anthropic
-    // requires alongside a replayed tool_use (without them the model sees
-    // a bare call and re-issues it, then confabulates a missing result).
-    let mut next_saved: Vec<usize> = vec![0; carriers.len()];
-    let mut ci = 0;
-    let mut out: Vec<Value> = Vec::with_capacity(frames.len() + carriers.len());
-    for f in frames.iter() {
+    // Each re-derived assistant frame takes the next saved message whose
+    // visible projection (text + tool_use ids) matches it. That restores
+    // the signed thinking Anthropic requires alongside a replayed tool_use
+    // (without it the model sees a bare call and re-issues it). A frame
+    // with no matching carrier stays as re-derived.
+    let mut next = 0;
+    for f in frames.iter_mut() {
         if f.get("type").and_then(Value::as_str) != Some("assistant") {
-            out.push(f.clone());
             continue;
         }
-        while ci < carriers.len() && next_saved[ci] >= carriers[ci].len() {
-            ci += 1;
-        }
-        if ci >= carriers.len() {
-            out.push(f.clone());
-            continue;
-        }
-        let ids = block_ids(&f["message"]);
-        if ids.is_empty() && is_text_only(f) {
-            // Text-only frame: take the next saved message that carries no
-            // tool_use of its own.
-            let saved = &carriers[ci];
-            if let Some(pos) = saved[next_saved[ci]..]
-                .iter()
-                .position(|m| !has_tool_use(m))
-            {
-                let idx = next_saved[ci] + pos;
-                out.push(json!({"type": "assistant", "message": saved[idx].clone()}));
-                next_saved[ci] = idx + 1;
-                continue;
-            }
-            out.push(f.clone());
-            continue;
-        }
-        // Tool frame: splice the contiguous run of saved messages whose
-        // tool_use ids cover this frame's ids in order.
-        let saved = &carriers[ci];
-        let mut got: Vec<String> = Vec::new();
-        let mut run = 0;
-        while next_saved[ci] + run < saved.len() && has_tool_use(&saved[next_saved[ci] + run]) {
-            got.extend(block_ids(&saved[next_saved[ci] + run]));
-            run += 1;
-            if got == ids {
-                break;
-            }
-        }
-        if !ids.is_empty() && got == ids {
-            for m in &saved[next_saved[ci]..next_saved[ci] + run] {
-                out.push(json!({"type": "assistant", "message": m.clone()}));
-            }
-            next_saved[ci] += run;
-        } else {
-            out.push(f.clone());
+        let want = assistant_projection(&f["message"]);
+        if let Some(pos) = pool[next..]
+            .iter()
+            .position(|m| assistant_projection(m) == want)
+        {
+            *f = json!({"type": "assistant", "message": pool[next + pos].clone()});
+            next += pos + 1;
         }
     }
-    *frames = out;
+}
+
+/// Merge consecutive partial messages sharing an id into one message.
+fn merge_partials(saved: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for m in saved {
+        let id = m.get("id").and_then(Value::as_str);
+        if let Some(last) = out.last_mut()
+            && id.is_some()
+            && last.get("id").and_then(Value::as_str) == id
+            && let (Some(dst), Some(src)) = (
+                last.get_mut("content").and_then(Value::as_array_mut),
+                m.get("content").and_then(Value::as_array),
+            )
+        {
+            dst.extend(src.iter().cloned());
+            continue;
+        }
+        out.push(m);
+    }
+    out
+}
+
+/// What the host sees of an assistant message: its text (whitespace
+/// ignored) and its tool_use ids. Thinking never projects.
+fn assistant_projection(m: &Value) -> (String, Vec<String>) {
+    let mut text = String::new();
+    let mut ids = Vec::new();
+    for b in m
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => text.extend(
+                b.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| !c.is_whitespace()),
+            ),
+            Some("tool_use") => ids.push(
+                b.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            _ => {}
+        }
+    }
+    (text, ids)
 }
 
 /// Extra body the relay injects: the inert tool manifest native sees.
@@ -419,8 +440,26 @@ pub fn extra_body(names: &[String], tools: &[Value]) -> Value {
     })
 }
 
-/// Spawn `claude` for one turn: history frames replay first (no-query each),
-/// then the final frame queries. Returns native stream-json lines.
+/// Spawn `claude` for one turn. Returns native stream-json lines.
+///
+/// History never goes over stdin as `shouldQuery: false` frames when it can
+/// be avoided: native appends assistant frames at once but queues user
+/// frames into the next querying message, so every historical tool_result
+/// lands after the final prompt, detached from its tool_use, and native
+/// pads each orphaned call with "[Tool result missing due to internal
+/// error]" — the model then believes its earlier calls failed and re-runs
+/// them. Instead native resumes a session holding the history
+/// (`--resume <sid> --resume-session-at <transcript uuid>`) and stdin only
+/// carries the new tail. The session is, in order of preference:
+/// 1. the one the previous turn left (resume point keyed by the projected
+///    conversation): the request is then byte-identical to the previous
+///    one plus the new tail, so the prompt cache hits;
+/// 2. a synthetic transcript of the history (correct pairing, cold cache);
+/// 3. last resort, stdin replay (pairing lost, as before).
+///
+/// A resume native refuses (session pruned, unknown uuid) fails before any
+/// upstream request and moves to the next option; any other failure —
+/// notably a rate limit — surfaces as-is.
 pub fn spawn_turn(
     turn: &PreparedTurn,
     extra: &Value,
@@ -433,12 +472,149 @@ pub fn spawn_turn(
             "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
         ));
     }
+    let frames = &turn.frames;
+    let split = frames
+        .iter()
+        .rposition(|f| f.get("type").and_then(Value::as_str) == Some("assistant"))
+        .map_or(0, |i| i + 1);
+    let run = |frames: &[Value], at: Option<&ResumePoint>| {
+        run_native(turn, extra, system, effort, timeout, frames, at, false)
+    };
+    let mut lines = None;
+    if split > 0 {
+        let (history, tail) = frames.split_at(split);
+        let stored = || session::lookup(resume_key(turn, system, history));
+        let synthetic = || session::synthesize(history);
+        for at in [&stored as &dyn Fn() -> Option<ResumePoint>, &synthetic] {
+            let Some(at) = at() else { continue };
+            match run(tail, Some(&at)) {
+                Err(e) if replay_after_failed_resume(&e) => continue,
+                r => {
+                    lines = Some(r?);
+                    break;
+                }
+            }
+        }
+    }
+    let lines = match lines {
+        Some(l) => l,
+        None => run(frames, None)?,
+    };
+    // Record where this conversation now lives: the session plus the
+    // transcript uuid of its last assistant line.
+    if let Some((sid, uuid)) = resume_point(&lines)
+        && session::prune_native_tool_results(&sid)
+    {
+        let mut convo = frames.clone();
+        convo.extend(
+            lines
+                .iter()
+                .filter(|v| v.get("type").and_then(Value::as_str) == Some("assistant"))
+                .map(|v| json!({"type": "assistant", "message": v["message"].clone()})),
+        );
+        let key = resume_key(turn, system, &convo);
+        session::save(key, &sid, &uuid);
+        // Warm the cache entry the next turn will resume into (see
+        // keepalive): same key, same point, same request shape.
+        crate::keepalive::note_turn(key, (sid, uuid), turn, system, extra, effort);
+    }
+    Ok(lines)
+}
+
+/// Prefix of a `run_native` error where native produced no answer.
+const NO_ANSWER: &str = "incomplete native response";
+
+/// Whether a failed `--resume` run may move on to the next way of loading
+/// history. Only a run that never answered qualifies: a missing session or
+/// unknown `--resume-session-at` uuid ends in an `error_during_execution`
+/// result with no assistant line and no request made. An upstream
+/// rejection (rate limit, overload) already spent a request — retrying
+/// would just hit the limit twice — and a timeout may still be generating,
+/// so both surface as-is.
+pub(crate) fn replay_after_failed_resume(err: &str) -> bool {
+    err.starts_with(NO_ANSWER)
+}
+
+/// Where a finished turn's conversation now lives: (native session id,
+/// transcript uuid of its last assistant line). `None` for anything not
+/// worth resuming: no session, a synthetic (client-side error) answer, an
+/// upstream error, or ids that don't look like native uuids.
+fn resume_point(lines: &[Value]) -> Option<ResumePoint> {
+    let result = lines
+        .iter()
+        .rev()
+        .find(|v| v.get("type").and_then(Value::as_str) == Some("result"))?;
+    if result.get("api_error_status").is_some_and(|s| !s.is_null()) {
+        return None;
+    }
+    let last = lines
+        .iter()
+        .rev()
+        .find(|v| v.get("type").and_then(Value::as_str) == Some("assistant"))?;
+    if last.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>") {
+        return None;
+    }
+    let sid = result.get("session_id").and_then(Value::as_str)?;
+    let uuid = last.get("uuid").and_then(Value::as_str)?;
+    (session::is_uuid(sid) && session::is_uuid(uuid)).then(|| (sid.to_string(), uuid.to_string()))
+}
+
+/// Judge a finished native run from its stream-json lines and exit status.
+///
+/// An upstream rejection (subscription limit, overload, auth) exits nonzero
+/// with an is_error result carrying the API status and the native sentence
+/// ("You've hit your session limit · resets …"); it is reported as such
+/// even without an assistant line, so it is never mistaken for a refused
+/// resume (which would be retried). `error_max_turns` is the tool boundary
+/// (`--max-turns 1`): the run can exit nonzero there while still having
+/// produced the calls the host needs.
+fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
+    let is = |v: &Value, t: &str| v.get("type").and_then(Value::as_str) == Some(t);
+    let tool_boundary = lines.iter().any(|v| {
+        is(v, "result") && v.get("subtype").and_then(Value::as_str) == Some("error_max_turns")
+    });
+    if !exit_ok && !tool_boundary {
+        let api = lines.iter().rev().find_map(|v| {
+            is(v, "result")
+                .then(|| v.get("api_error_status").and_then(Value::as_u64))
+                .flatten()
+                .map(|code| (code, v.get("result").and_then(Value::as_str).unwrap_or("")))
+        });
+        if let Some((code, text)) = api {
+            return Err(format!("{API_ERROR}{code}: {text}"));
+        }
+    }
+    if !lines.iter().any(|v| is(v, "result")) || !lines.iter().any(|v| is(v, "assistant")) {
+        return Err(format!("{NO_ANSWER}: assistant and one result required"));
+    }
+    if !exit_ok && !tool_boundary {
+        return Err("native request failed (nonzero exit without a success result)".into());
+    }
+    Ok(())
+}
+
+/// `keepalive` marks cache-keepalive probes ([`crate::keepalive`]) in the
+/// debug dump only; the spawn itself is identical either way.
+pub(crate) fn run_native(
+    turn: &PreparedTurn,
+    extra: &Value,
+    system: &str,
+    effort: Option<&str>,
+    timeout: std::time::Duration,
+    frames: &[Value],
+    resume: Option<&ResumePoint>,
+    keepalive: bool,
+) -> Result<Vec<Value>, String> {
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let stage = tempfile_stage()?;
-    let settings_path = stage.join("settings.json");
-    std::fs::write(
+    let extra_s = extra.to_string();
+    // Per-content name: concurrent turns with different tool sets must not
+    // race on one settings file.
+    let settings_path = tempfile_stage()?.join(format!("settings-{:016x}.json", hash_of(&extra_s)));
+    session::write_atomic(
         &settings_path,
-        json!({"env": {"CLAUDE_CODE_EXTRA_BODY": extra.to_string()}}).to_string(),
+        json!({"env": {"CLAUDE_CODE_EXTRA_BODY": extra_s}})
+            .to_string()
+            .as_bytes(),
     )
     .map_err(|e| format!("staging settings.json: {e}"))?;
     let mut argv: Vec<String> = vec![
@@ -462,15 +638,22 @@ pub fn spawn_turn(
         "--strict-mcp-config".into(),
         "--disable-slash-commands".into(),
         // One turn: a tool_use ends the native run; the host executes the
-        // call and the result returns as a replayed frame next turn.
+        // call and the result returns as a new frame next turn.
         "--max-turns".into(),
         "1".into(),
         "--permission-mode".into(),
         "dontAsk".into(),
-        "--no-session-persistence".into(),
         "--mcp-config".into(),
         json!({"mcpServers": {}}).to_string(),
     ];
+    if let Some((sid, uuid)) = resume {
+        argv.extend([
+            "--resume".into(),
+            sid.clone(),
+            "--resume-session-at".into(),
+            uuid.clone(),
+        ]);
+    }
     if let Some(e) = effort.filter(|e| *e != "off") {
         argv.push("--effort".into());
         argv.push(e.to_string());
@@ -492,9 +675,17 @@ pub fn spawn_turn(
         .env("WAYLAND_DISPLAY", "")
         .spawn()
         .map_err(|_| setup::INSTALL_HINT.to_string())?;
-    let frames = &turn.frames;
     let debug = std::env::var_os("CLAUDE_SUB_DEBUG").is_some();
     let mut sent: Vec<Value> = Vec::new();
+    let mut stdin_closed = false;
+    if debug {
+        if keepalive {
+            sent.push(json!({"keepalive": true}));
+        }
+        if let Some((sid, uuid)) = resume {
+            sent.push(json!({"resume": sid, "at": uuid}));
+        }
+    }
     {
         let mut stdin = child
             .stdin
@@ -509,39 +700,100 @@ pub fn spawn_turn(
                 sent.push(f.clone());
             }
             let line = serde_json::to_string(&f).map_err(|e| format!("frame encode: {e}"))? + "\n";
-            stdin
-                .write_all(line.as_bytes())
-                .map_err(|_| "native stdin closed".to_string())?;
+            if stdin.write_all(line.as_bytes()).is_err() {
+                // Native exited early (e.g. a refused resume): judge its
+                // output below instead of masking it as a pipe error.
+                stdin_closed = true;
+                break;
+            }
         }
     }
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "native stdout unavailable".to_string())?;
-    let lines = read_lines(stdout, timeout)?;
+    let lines = match read_lines(stdout, timeout) {
+        Ok(l) => l,
+        Err(e) => {
+            // Never leave a timed-out native run writing to its session.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    // Persisted sessions are ours to sweep, whatever the outcome.
+    if let Some(sid) = lines
+        .iter()
+        .find_map(|v| v.get("session_id").and_then(Value::as_str))
+    {
+        session::adopt(sid);
+    }
     if debug {
         dump_debug(&sent, &lines);
     }
     let status = child.wait().map_err(|e| format!("native wait: {e}"))?;
-    let saw_result = lines
-        .iter()
-        .any(|v: &Value| v.get("type").and_then(Value::as_str) == Some("result"));
-    let saw_assistant = lines
-        .iter()
-        .any(|v: &Value| v.get("type").and_then(Value::as_str) == Some("assistant"));
-    if !saw_result || !saw_assistant {
-        return Err("incomplete native response: assistant and one result required".into());
-    }
-    // error_max_turns is the tool boundary (--max-turns 1): the run can exit
-    // nonzero there while still having produced the calls the host needs.
-    let tool_boundary = lines.iter().any(|v: &Value| {
-        v.get("type").and_then(Value::as_str) == Some("result")
-            && v.get("subtype").and_then(Value::as_str) == Some("error_max_turns")
-    });
-    if !status.success() && !tool_boundary {
-        return Err("native request failed (nonzero exit without a success result)".into());
+    judge(&lines, status.success())?;
+    if stdin_closed {
+        return Err("native stdin closed".into());
     }
     Ok(lines)
+}
+
+const API_ERROR: &str = "native API error ";
+
+/// Split a [`run_native`] upstream rejection into the HTTP status the relay
+/// should answer with and the native message. `None` for everything else.
+pub fn api_error(detail: &str) -> Option<(u16, &str)> {
+    let (code, text) = detail.strip_prefix(API_ERROR)?.split_once(": ")?;
+    let code: u16 = code.parse().ok().filter(|c| (400..600).contains(c))?;
+    Some((code, if text.is_empty() { detail } else { text }))
+}
+
+/// FNV-1a: stable across processes and toolchains (resume files written by
+/// one build must key the same under the next).
+fn hash_of(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Resume key: everything a resumed session fixes — where native files it
+/// and what its environment block says (cwd), the model, the system prompt
+/// (native snapshots it on the first request) and the conversation as the
+/// host sees it. Thinking and partial-message splits don't project, so a
+/// carrier that failed to restore still keys the same.
+fn resume_key(turn: &PreparedTurn, system: &str, frames: &[Value]) -> u64 {
+    let mut runs: Vec<(String, Vec<String>)> = Vec::new();
+    for f in frames {
+        let role = f
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let msg = f.get("message").cloned().unwrap_or(Value::Null);
+        let parts: Vec<String> = if role == "assistant" {
+            let (text, ids) = assistant_projection(&msg);
+            std::iter::once(text).chain(ids).collect()
+        } else {
+            msg.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(Value::to_string)
+                .collect()
+        };
+        match runs.last_mut() {
+            Some((r, p)) if *r == role && role == "assistant" => {
+                // Partial lines of one answer project as one message.
+                p[0].push_str(&parts[0]);
+                p.extend(parts.into_iter().skip(1));
+            }
+            Some((r, p)) if *r == role => p.extend(parts),
+            _ => runs.push((role, parts)),
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    hash_of(&json!([cwd, turn.native_model, system, runs]).to_string())
 }
 
 /// CLAUDE_SUB_DEBUG=1 dump: the frames sent to native and the stream-json
