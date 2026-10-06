@@ -599,6 +599,7 @@ fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
 
 /// `keepalive` marks cache-keepalive probes ([`crate::keepalive`]) in the
 /// debug dump only; the spawn itself is identical either way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_native(
     turn: &PreparedTurn,
     extra: &Value,
