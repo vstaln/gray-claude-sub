@@ -22,9 +22,11 @@
 //! same entry. The resume point itself is never rewritten — the probe does
 //! not call `session::save`.
 //!
-//! Bounds: one entry per conversation — a turn's point supersedes the one
-//! it resumed from (and any older point in the same native session), so
-//! only the latest point is ever probed. A key is warmed only while its
+//! Bounds: one sidecar process serves one Gray conversation, so a new
+//! resume point replaces every entry — only the latest point in the
+//! process is ever probed. A session started fresh after compaction does
+//! not resume from the old one, which used to leave it warmed for the
+//! whole [`WARM_WINDOW`]. A key is warmed only while its
 //! last real turn is younger than [`WARM_WINDOW`] (each probe costs one
 //! cache-read of the full prefix plus a spawn), the sweeper is a single
 //! thread that claims a key under the lock before spawning so a key never
@@ -100,12 +102,11 @@ fn registry() -> &'static Mutex<HashMap<u64, Warm>> {
 
 /// A real turn finished and left a resume point: (re)start warming the
 /// conversation. Called from [`crate::chat::spawn_turn`] right after the
-/// point is saved; the key is the same one the next turn looks up. `prev`
-/// is the key this turn resumed from: it and every other point in the same
-/// native session are superseded, so only the latest point stays warm.
+/// point is saved; the key is the same one the next turn looks up. One
+/// sidecar serves one conversation, so the new point replaces every older
+/// entry — only the latest point stays warm.
 pub fn note_turn(
     key: u64,
-    prev: Option<u64>,
     point: ResumePoint,
     turn: &PreparedTurn,
     system: &str,
@@ -126,15 +127,13 @@ pub fn note_turn(
         last_contact: now,
         failures: 0,
     };
-    let _ = registry()
-        .lock()
-        .map(|mut m| supersede(&mut m, key, prev, warm));
+    let _ = registry().lock().map(|mut m| supersede(&mut m, key, warm));
 }
 
-/// Insert `warm` under `key`, dropping the entries it replaces: `prev` and
-/// any other point in the same native session.
-fn supersede(map: &mut HashMap<u64, Warm>, key: u64, prev: Option<u64>, warm: Warm) {
-    map.retain(|k, w| Some(*k) != prev && w.point.0 != warm.point.0);
+/// Insert `warm` under `key`, dropping every other entry: one sidecar
+/// process serves one conversation, so only its latest point is warmed.
+fn supersede(map: &mut HashMap<u64, Warm>, key: u64, warm: Warm) {
+    map.clear();
     map.insert(key, warm);
 }
 

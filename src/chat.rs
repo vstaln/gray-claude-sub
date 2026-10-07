@@ -520,7 +520,7 @@ pub fn spawn_turn(
         session::save(key, &sid, &uuid);
         // Warm the cache entry the next turn will resume into (see
         // keepalive): same key, same point, same request shape.
-        crate::keepalive::note_turn(key, prev_key, (sid, uuid), turn, system, extra, effort);
+        crate::keepalive::note_turn(key, (sid, uuid), turn, system, extra, effort);
     }
     Ok(lines)
 }

@@ -50,6 +50,9 @@ pub fn provider() -> ProviderDecl {
             },
             request: ProviderRequestPolicyDecl {
                 prompt_cache_key: false,
+                // Relay sidecar spawning per-turn `claude` children: the
+                // host must never verbatim-replay its requests.
+                warm_replay: false,
                 store: false,
                 include_reasoning_encrypted: true,
                 previous_response_id: false,

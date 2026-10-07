@@ -18,6 +18,8 @@ pub fn catalog() -> ProviderModelCatalog {
             name: catalog::display_name(&id),
             context_window: catalog::context_window(&id),
             reasoning_efforts: EFFORTS.iter().map(|s| s.to_string()).collect(),
+            variants: Vec::new(),
+            slots: Vec::new(),
             id,
         })
         .collect();
