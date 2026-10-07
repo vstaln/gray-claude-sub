@@ -6,7 +6,7 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "claude-sub";
-pub const PLUGIN_VERSION: &str = "0.1.3";
+pub const PLUGIN_VERSION: &str = "0.1.4";
 pub const PROVIDER_ID: &str = "claude-subscription";
 pub const AUTH_METHOD_ID: &str = "claude-login";
 
@@ -59,6 +59,10 @@ pub fn provider() -> ProviderDecl {
                 tool_choice: Some("auto".to_string()),
                 parallel_tool_calls: Some(true),
                 text_verbosity: Some("low".to_string()),
+                // Claude's native prompt cache lives ~1h, not the host's
+                // 5-minute default — the warmth timer and cold-cache
+                // notices must know, or they flag healthy idles as misses.
+                cache_ttl_secs: Some(3600),
             },
             headers: vec![ProviderHeaderDecl {
                 name: "session-id".to_string(),
