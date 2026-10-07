@@ -235,13 +235,6 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
         .ok_or_else(|| "relay intent expired".to_string())?;
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
-    let turn = crate::chat::prepare_turn(&body, &intent.model)?;
-    let tools: Vec<Value> = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let extra = crate::chat::extra_body(&turn.names, &tools);
     // The effort rides inside the POST body's `reasoning` object —
     // `provider/chat` params have no effort field.
     let effort = body
@@ -249,17 +242,15 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
         .and_then(|r| r.get("effort"))
         .and_then(Value::as_str)
         .or(intent.effort.as_deref());
-    // History loads into a resumed native session, the final frame queries:
-    // native makes exactly one upstream request on its own.
-    let lines = crate::chat::spawn_turn(
-        &turn,
-        &extra,
-        &turn.system.clone(),
-        effort,
-        Duration::from_secs(300),
-    )?;
-    let names: Vec<String> = tools
-        .iter()
+    // One live native session per conversation: a continuing request
+    // writes only its delta into the pooled child; tool calls park inside
+    // the child's `gray` MCP server until a later turn answers them.
+    let lines = crate::live::run_turn(&body, &intent.model, effort, Duration::from_secs(300))?;
+    let names: Vec<String> = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
         .collect();
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});

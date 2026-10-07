@@ -1,254 +1,107 @@
-//! Prompt-cache keepalive: re-warm a resumed session before its upstream
-//! cache entry lapses.
+//! Prompt-cache keepalive for the live-session pool, plus the idle
+//! reaper that bounds it.
 //!
-//! Every host turn spawns a fresh `claude` child that resumes the recorded
-//! session (see [`crate::chat::spawn_turn`]). The resumed prefix rides the
-//! Anthropic prompt cache, which lives about an hour; a turn that lands
-//! after it lapses pays a full cache write of the whole history. When a
-//! turn leaves a usable resume point, [`note_turn`] remembers it here, and
-//! once the key has seen no upstream contact for [`REFRESH_AFTER`] a
-//! background probe re-runs the same request — same model, system prompt,
-//! effort and tool manifest, or the prefix wouldn't match the cache entry
-//! — resumed at the same point with a throwaway prompt. The upstream read
-//! renews the TTL.
+//! A live `claude` child ([`crate::live`]) keeps its own prompt cache
+//! warm by existing — until it doesn't: Anthropic's cache entry lapses
+//! about an hour after the last upstream contact, and a turn landing
+//! after that pays a full cache write of the whole conversation. So
+//! every [`REFRESH_AFTER`] of upstream silence the sweeper writes a
+//! tiny [`PROMPT`] user frame into the session's own stdin and drains
+//! it to its `result`: one cheap cache-read, the TTL renews, the
+//! session never leaves the pool for a probe and no throwaway child or
+//! `--fork-session` branch exists to sweep afterwards.
 //!
-//! The probe never writes into the real session: it resumes with
-//! `--fork-session` into a throwaway session id, deleted afterwards. Native
-//! resolves `--resume-session-at` only along the chain ending at the
-//! session's newest entry, so a probe branch appended to the real file made
-//! the stored point unreachable ("No message found with message.uuid") and
-//! the next real turn fell back to a cold synthetic transcript. The prompt
-//! cache keys on request content, not session id, so the fork warms the
-//! same entry. The resume point itself is never rewritten — the probe does
-//! not call `session::save`.
+//! A refresh never touches the matching state: the probe doesn't move
+//! `last_used` (the idle clock [`WARM_WINDOW`] and the reaper read), so
+//! warming can't make a dead conversation look alive — it only bumps
+//! `last_contact`, the [`REFRESH_AFTER`] clock. Skipped: rate-limited
+//! sessions (the probe would burn its own limit), sessions parked on a
+//! host tool call (mid-conversation — they owe answers, not probes),
+//! dead children, and anything checked out mid-turn (the pool hands a
+//! due session out of the pool while it refreshes, so a matching turn
+//! waits on it rather than re-billing the transcript on a fresh child).
 //!
-//! Bounds: one sidecar process serves one Gray conversation, so a new
-//! resume point replaces every entry — only the latest point in the
-//! process is ever probed. A session started fresh after compaction does
-//! not resume from the old one, which used to leave it warmed for the
-//! whole [`WARM_WINDOW`]. A key is warmed only while its
-//! last real turn is younger than [`WARM_WINDOW`] (each probe costs one
-//! cache-read of the full prefix plus a spawn), the sweeper is a single
-//! thread that claims a key under the lock before spawning so a key never
-//! has two probes in flight, and
-//! [`MAX_FAILURES`] consecutive failures — or a refused resume, which means
-//! the point is dead — stop the warming. A probe counts as upstream
-//! contact win or lose, so a persistent failure retries after
-//! [`REFRESH_AFTER`], not every poll.
-//!
-//! Probes go straight to `claude`: they never touch the relay or an
-//! intent, so nothing reaches the host — no turn, no usage. Under
-//! `CLAUDE_SUB_DEBUG` their spawns dump like any other, marked
-//! `{"keepalive": true}` in the sent frames.
+//! The same sweep reaps: a session idle past [`IDLE_TTL`] whose cache
+//! is no longer worth warming, a dead child or a dead `gray` bridge,
+//! and a session whose failure streak hit [`MAX_FAILURES`]. A probe
+//! counts as upstream contact win or lose, so a persistent failure
+//! retries after [`REFRESH_AFTER`], not every [`POLL`].
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-use serde_json::{Value, json};
-
-use crate::chat::{self, PreparedTurn};
-use crate::session::{self, ResumePoint};
 
 /// Upstream contact this idle gets re-warmed: under the ~1h cache TTL,
 /// far enough that [`POLL`] jitter can't overshoot the TTL.
 pub const REFRESH_AFTER: Duration = Duration::from_secs(50 * 60);
 /// Stop warming a conversation this long after its last real turn.
 pub const WARM_WINDOW: Duration = Duration::from_secs(6 * 3600);
+/// A session idle past this is swept — unless still warmable, i.e. its
+/// cache entry may yet be refreshed inside the warm window.
+pub(crate) const IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// Sweeper cadence.
 const POLL: Duration = Duration::from_secs(60);
-/// A probe is a cache-read plus a short completion; don't hold a child
-/// longer than this. Best-effort: a timeout just skips the cycle.
+/// A probe is a cache-read plus a short completion; don't hold the
+/// session longer than this. Best-effort: a timeout kills the session —
+/// a prompt in flight past the deadline is ambiguous state.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Consecutive probe failures before a key stops being warmed.
-const MAX_FAILURES: u32 = 3;
-/// The throwaway prompt: minimal, and its branch is never resumed.
-const PROMPT: &str = ".";
+/// Consecutive probe failures before a session stops being warmed.
+pub(crate) const MAX_FAILURES: u32 = 3;
+/// The probe prompt: one character — the cheapest cache-touching query.
+pub(crate) const PROMPT: &str = ".";
 
-/// Everything a probe needs to rebuild the real turn's request. Model,
-/// system prompt, effort and tool manifest are all part of the cached
-/// prefix: any difference and the probe warms a new entry, not the one
-/// the next real turn will hit.
-#[derive(Clone)]
-struct Probe {
-    model: String,
-    system: String,
-    extra: Value,
-    effort: Option<String>,
+/// Whether a session's cache entry is still worth renewing: inside the
+/// warm window since its last real turn, and not sitting out a rate
+/// limit (the probe would be rejected anyway).
+pub(crate) fn warm_eligible(now: Instant, last_used: Instant, rate_limited: bool) -> bool {
+    !rate_limited && now.duration_since(last_used) < WARM_WINDOW
 }
 
-/// A conversation worth warming: where to resume it, what to resend, and
-/// the two clocks that bound the warming.
-struct Warm {
-    point: ResumePoint,
-    probe: Probe,
-    /// The cwd the session file lives under (`projects/<cwd-derived>`):
-    /// the probe is only meaningful while the sidecar still runs there.
-    cwd: PathBuf,
-    /// Last host turn — the idle clock [`WARM_WINDOW`] bounds.
-    last_real: Instant,
-    /// Last upstream request, real turn or probe — the [`REFRESH_AFTER`]
-    /// clock. A probe resets it: the cache entry is renewed either way.
-    last_contact: Instant,
-    /// Consecutive failed probes.
+/// Whether a live session wants a refresh probe now: contact old enough
+/// to need one while the conversation is still inside the warm window,
+/// the session alive, below the failure cap and not parked on host tool
+/// calls (a parked front query is mid-conversation — it owes answers,
+/// not probes).
+pub(crate) fn refresh_due(
+    now: Instant,
+    last_used: Instant,
+    last_contact: Option<Instant>,
+    rate_limited: bool,
     failures: u32,
+    alive: bool,
+    parked_open: bool,
+) -> bool {
+    alive
+        && !parked_open
+        && failures < MAX_FAILURES
+        && warm_eligible(now, last_used, rate_limited)
+        && last_contact.is_some_and(|c| now.duration_since(c) >= REFRESH_AFTER)
 }
 
-fn registry() -> &'static Mutex<HashMap<u64, Warm>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u64, Warm>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// A real turn finished and left a resume point: (re)start warming the
-/// conversation. Called from [`crate::chat::spawn_turn`] right after the
-/// point is saved; the key is the same one the next turn looks up. One
-/// sidecar serves one conversation, so the new point replaces every older
-/// entry — only the latest point stays warm.
-pub fn note_turn(
-    key: u64,
-    point: ResumePoint,
-    turn: &PreparedTurn,
-    system: &str,
-    extra: &Value,
-    effort: Option<&str>,
-) {
-    let now = Instant::now();
-    let warm = Warm {
-        point,
-        probe: Probe {
-            model: turn.native_model.clone(),
-            system: system.to_string(),
-            extra: extra.clone(),
-            effort: effort.map(str::to_string),
-        },
-        cwd: std::env::current_dir().unwrap_or_default(),
-        last_real: now,
-        last_contact: now,
-        failures: 0,
-    };
-    let _ = registry().lock().map(|mut m| supersede(&mut m, key, warm));
-}
-
-/// Insert `warm` under `key`, dropping every other entry: one sidecar
-/// process serves one conversation, so only its latest point is warmed.
-fn supersede(map: &mut HashMap<u64, Warm>, key: u64, warm: Warm) {
-    map.clear();
-    map.insert(key, warm);
-}
-
-/// Whether a key wants a probe now: upstream contact old enough to need
-/// one while the real turn is still inside the warm window.
-fn needs_refresh(contact_idle: Duration, real_idle: Duration) -> bool {
-    contact_idle >= REFRESH_AFTER && real_idle < WARM_WINDOW
-}
-
-/// One poll's decision: drop entries that aged out of the window (or
-/// whose session's cwd no longer matches), return the keys now due.
-fn plan(map: &mut HashMap<u64, Warm>, now: Instant, cwd: &Path) -> Vec<u64> {
-    map.retain(|_, w| w.cwd == cwd && now.duration_since(w.last_real) < WARM_WINDOW);
-    let mut due: Vec<u64> = map
-        .iter()
-        .filter(|(_, w)| {
-            needs_refresh(
-                now.duration_since(w.last_contact),
-                now.duration_since(w.last_real),
-            )
-        })
-        .map(|(k, _)| *k)
-        .collect();
-    due.sort_unstable();
-    due
-}
-
-/// The throwaway prompt as one querying user frame (the only stdin frame,
-/// so `run_native` does not mark it `shouldQuery: false`).
-fn probe_frames() -> Vec<Value> {
-    vec![json!({"type": "user", "message": {"role": "user",
-        "content": [{"type": "text", "text": PROMPT}]}})]
-}
-
-/// Claim key's refresh: mark upstream contact under the lock and hand out
-/// what the probe needs. `None` when the entry went away or stopped being
-/// due — a real turn that landed since the scan resets the idle clock.
-fn claim(key: u64) -> Option<(ResumePoint, Probe)> {
-    let mut m = registry().lock().ok()?;
-    let w = m.get_mut(&key)?;
-    if !needs_refresh(w.last_contact.elapsed(), w.last_real.elapsed()) {
-        return None;
-    }
-    w.last_contact = Instant::now();
-    Some((w.point.clone(), w.probe.clone()))
-}
-
-/// Fold a finished probe back into the entry: success clears the failure
-/// streak, a refused resume drops the entry (the point is dead), anything
-/// else counts toward [`MAX_FAILURES`].
-fn finish(key: u64, err: Option<&str>) {
-    let Ok(mut m) = registry().lock() else {
-        return;
-    };
-    let dead = match err {
-        None => {
-            if let Some(w) = m.get_mut(&key) {
-                w.failures = 0;
-            }
-            false
-        }
-        Some(e) if chat::replay_after_failed_resume(e) => true,
-        Some(_) => match m.get_mut(&key) {
-            Some(w) => {
-                w.failures += 1;
-                w.failures >= MAX_FAILURES
-            }
-            None => false,
-        },
-    };
-    if dead {
-        m.remove(&key);
+/// The sweeper's kill rule: a dead wire (child exited or `gray` bridge
+/// gone), a spent failure budget, or idleness past [`IDLE_TTL`] with
+/// nothing left to warm — a warmable session survives the TTL because
+/// its refresh probes keep the cache entry it was kept alive for.
+pub(crate) fn reapable(
+    now: Instant,
+    last_used: Instant,
+    rate_limited: bool,
+    failures: u32,
+    dead: bool,
+) -> bool {
+    dead || failures >= MAX_FAILURES || {
+        now.duration_since(last_used) > IDLE_TTL && !warm_eligible(now, last_used, rate_limited)
     }
 }
 
-/// One probe: resume the stored session at the stored point — forked into
-/// a throwaway session, so the real one is untouched — and re-issue the
-/// real turn's request shape with the throwaway prompt. The single sweeper
-/// thread runs this inline, so keys refresh serially and never
-/// concurrently with themselves.
-fn refresh(key: u64) {
-    let Some((point, probe)) = claim(key) else {
-        return;
-    };
-    let turn = PreparedTurn {
-        system: probe.system.clone(),
-        frames: probe_frames(),
-        names: Vec::new(),
-        native_model: probe.model.clone(),
-    };
-    let fork = session::new_uuid();
-    let result = chat::run_native(
-        &turn,
-        &probe.extra,
-        &probe.system,
-        probe.effort.as_deref(),
-        PROBE_TIMEOUT,
-        &turn.frames,
-        Some(&point),
-        Some(&fork),
-    );
-    session::discard(&fork);
-    finish(key, result.err().as_deref());
-}
-
+/// The sweeper: reap first, then refresh every due session serially —
+/// a refresh checks the session out of the pool so a matching turn
+/// waits on it rather than spawning cold.
 fn run() {
     loop {
         std::thread::sleep(POLL);
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let due = registry()
-            .lock()
-            .map(|mut m| plan(&mut m, Instant::now(), &cwd))
-            .unwrap_or_default();
-        for key in due {
-            refresh(key);
+        crate::live::reap_idle();
+        while let Some(mut s) = crate::live::take_refresh_candidate() {
+            let result = s.refresh(Instant::now() + PROBE_TIMEOUT);
+            crate::live::finish_refresh(s, result.err().as_deref());
         }
     }
 }

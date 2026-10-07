@@ -1,12 +1,21 @@
-//! One-shot chat turn over the loopback relay. Mirrors the Hermes DirectSDK
+//! The Responses→native translation layer, driven by the pooled live
+//! sessions in [`crate::live`]. Mirrors the Hermes DirectSDK
 //! `Client.chat.completions.create` flow
 //! (NousResearch/hermes-plugin-claude-subscription-directsdk, MIT):
 //!
-//! history loads into a resumed native session (see [`spawn_turn`]; stdin
-//! `shouldQuery: false` replay is only the last resort), the final
-//! user/tool-result frame queries. Native answers with exactly one
-//! upstream request (the admission relay enforces it); gray owns tools,
-//! approvals and compaction — Claude only answers.
+//! `prepare_turn` folds an OpenAI Responses request into the stream-json
+//! frames a `claude -p --input-format stream-json` session consumes; a
+//! cold session resumes a stored native session for its history (stdin
+//! `shouldQuery: false` replay is only the last resort) while a warm
+//! session takes only the delta; the final user/tool-result frame
+//! queries. Native answers with exactly one upstream request per query
+//! (the admission relay enforces it); gray owns tools, approvals and
+//! compaction — Claude only answers.
+//!
+//! Tool calls park inside the `gray` MCP server ([`crate::mcp`]) mounted
+//! on the live child: `tools/call` blocks on the session socket until a
+//! later turn's `function_call_output` supplies the result — the park is
+//! the turn boundary `--max-turns 1` used to fake.
 //!
 //! The relay speaks the OpenAI Responses SSE wire the host already streams,
 //! so no host changes are needed: the declared transport points at the
@@ -14,23 +23,24 @@
 //! per-turn bearer.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::Write;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 
 use crate::session::{self, ResumePoint};
-use crate::setup;
 
 /// Tool-name prefix native sees (host names restored on the way back).
 pub const TOOL_PREFIX: &str = "mcp__gray__";
 /// Relay rejection when native retries past the single admitted request.
 pub const ADMISSION_CONSUMED: &str = "HERMES_MODEL_ADMISSION_CONSUMED";
 
-/// One translated turn: system text, native history frames, host tool names.
+/// One translated turn: system text, native history frames, host tool
+/// names — and `input`, the request's `input` array verbatim, what
+/// [`crate::live`] continuation matching compares absorbed state against.
 pub struct PreparedTurn {
     pub system: String,
     pub frames: Vec<Value>,
+    pub input: Vec<Value>,
     pub names: Vec<String>,
     pub native_model: String,
 }
@@ -69,7 +79,7 @@ fn check_tool_name(name: &str, seen: &HashSet<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn text_of(blocks: &Value) -> String {
+pub(crate) fn text_of(blocks: &Value) -> String {
     match blocks {
         Value::String(s) => s.clone(),
         Value::Array(arr) => arr
@@ -87,7 +97,7 @@ fn text_of(blocks: &Value) -> String {
 }
 
 /// Anthropic image blocks for the `input_image` data-URL parts in `blocks`.
-fn images_of(blocks: &Value) -> Vec<Value> {
+pub(crate) fn images_of(blocks: &Value) -> Vec<Value> {
     let Value::Array(arr) = blocks else {
         return Vec::new();
     };
@@ -103,7 +113,7 @@ fn images_of(blocks: &Value) -> Vec<Value> {
 
 /// Kind of a Responses input item: the `type` field, or "message" for the
 /// EasyInputMessage short form (role present, type absent) the host emits.
-fn item_kind(item: &Value) -> &str {
+pub(crate) fn item_kind(item: &Value) -> &str {
     match item.get("type").and_then(Value::as_str) {
         Some(k) => k,
         None if item.get("role").is_some() => "message",
@@ -315,6 +325,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     Ok(PreparedTurn {
         system: system_parts.join("\n\n"),
         frames,
+        input,
         names,
         native_model: crate::catalog::native_model(model)?,
     })
@@ -428,104 +439,10 @@ fn assistant_projection(m: &Value) -> (String, Vec<String>) {
     (text, ids)
 }
 
-/// Extra body the relay injects: the inert tool manifest native sees.
-pub fn extra_body(names: &[String], tools: &[Value]) -> Value {
-    json!({
-        "tools": names.iter().map(|n| {
-            let t = tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(n));
-            json!({"name": format!("{TOOL_PREFIX}{n}"),
-                "description": t.and_then(|t| t.get("description").and_then(Value::as_str)).unwrap_or(""),
-                "input_schema": t.map(|t| normalize_input_schema(t.get("parameters").unwrap_or(&json!({})))).unwrap_or(json!({}))})
-        }).collect::<Vec<_>>(),
-    })
-}
-
-/// Spawn `claude` for one turn. Returns native stream-json lines.
-///
-/// History never goes over stdin as `shouldQuery: false` frames when it can
-/// be avoided: native appends assistant frames at once but queues user
-/// frames into the next querying message, so every historical tool_result
-/// lands after the final prompt, detached from its tool_use, and native
-/// pads each orphaned call with "[Tool result missing due to internal
-/// error]" — the model then believes its earlier calls failed and re-runs
-/// them. Instead native resumes a session holding the history
-/// (`--resume <sid> --resume-session-at <transcript uuid>`) and stdin only
-/// carries the new tail. The session is, in order of preference:
-/// 1. the one the previous turn left (resume point keyed by the projected
-///    conversation): the request is then byte-identical to the previous
-///    one plus the new tail, so the prompt cache hits;
-/// 2. a synthetic transcript of the history (correct pairing, cold cache);
-/// 3. last resort, stdin replay (pairing lost, as before).
-///
-/// A resume native refuses (session pruned, unknown uuid) fails before any
-/// upstream request and moves to the next option; any other failure —
-/// notably a rate limit — surfaces as-is.
-pub fn spawn_turn(
-    turn: &PreparedTurn,
-    extra: &Value,
-    system: &str,
-    effort: Option<&str>,
-    timeout: std::time::Duration,
-) -> Result<Vec<Value>, String> {
-    if let Some(key) = setup::conflicting_env() {
-        return Err(format!(
-            "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
-        ));
-    }
-    let frames = &turn.frames;
-    let split = frames
-        .iter()
-        .rposition(|f| f.get("type").and_then(Value::as_str) == Some("assistant"))
-        .map_or(0, |i| i + 1);
-    let run = |frames: &[Value], at: Option<&ResumePoint>| {
-        run_native(turn, extra, system, effort, timeout, frames, at, None)
-    };
-    let mut lines = None;
-    // The key the previous turn of this conversation saved under: once this
-    // turn records its own point, that one is superseded.
-    let prev_key = (split > 0).then(|| resume_key(turn, system, &frames[..split]));
-    if let Some(prev) = prev_key {
-        let tail = &frames[split..];
-        let stored = || session::lookup(prev);
-        let history = &frames[..split];
-        let synthetic = || session::synthesize(history);
-        for at in [&stored as &dyn Fn() -> Option<ResumePoint>, &synthetic] {
-            let Some(at) = at() else { continue };
-            match run(tail, Some(&at)) {
-                Err(e) if replay_after_failed_resume(&e) => continue,
-                r => {
-                    lines = Some(r?);
-                    break;
-                }
-            }
-        }
-    }
-    let lines = match lines {
-        Some(l) => l,
-        None => run(frames, None)?,
-    };
-    // Record where this conversation now lives: the session plus the
-    // transcript uuid of its last assistant line.
-    if let Some((sid, uuid)) = resume_point(&lines)
-        && session::prune_native_tool_results(&sid)
-    {
-        let mut convo = frames.clone();
-        convo.extend(
-            lines
-                .iter()
-                .filter(|v| v.get("type").and_then(Value::as_str) == Some("assistant"))
-                .map(|v| json!({"type": "assistant", "message": v["message"].clone()})),
-        );
-        let key = resume_key(turn, system, &convo);
-        session::save(key, &sid, &uuid);
-        // Warm the cache entry the next turn will resume into (see
-        // keepalive): same key, same point, same request shape.
-        crate::keepalive::note_turn(key, (sid, uuid), turn, system, extra, effort);
-    }
-    Ok(lines)
-}
-
-/// Prefix of a `run_native` error where native produced no answer.
+/// Prefix of a judged-lines error where native produced no answer: a
+/// refused resume ends with a result but no assistant line — safe to
+/// retry on the next history-loading tier since no upstream request was
+/// spent (see [`crate::live::spawn_conversation`]).
 const NO_ANSWER: &str = "incomplete native response";
 
 /// Whether a failed `--resume` run may move on to the next way of loading
@@ -543,7 +460,7 @@ pub(crate) fn replay_after_failed_resume(err: &str) -> bool {
 /// transcript uuid of its last assistant line). `None` for anything not
 /// worth resuming: no session, a synthetic (client-side error) answer, an
 /// upstream error, or ids that don't look like native uuids.
-fn resume_point(lines: &[Value]) -> Option<ResumePoint> {
+pub(crate) fn resume_point(lines: &[Value]) -> Option<ResumePoint> {
     let result = lines
         .iter()
         .rev()
@@ -569,10 +486,10 @@ fn resume_point(lines: &[Value]) -> Option<ResumePoint> {
 /// with an is_error result carrying the API status and the native sentence
 /// ("You've hit your session limit · resets …"); it is reported as such
 /// even without an assistant line, so it is never mistaken for a refused
-/// resume (which would be retried). `error_max_turns` is the tool boundary
-/// (`--max-turns 1`): the run can exit nonzero there while still having
-/// produced the calls the host needs.
-fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
+/// resume (which would be retried). A `result` with
+/// `subtype: error_max_turns` (a stray the history carries) also excuses
+/// a nonzero exit.
+pub(crate) fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
     let is = |v: &Value, t: &str| v.get("type").and_then(Value::as_str) == Some(t);
     let tool_boundary = lines.iter().any(|v| {
         is(v, "result") && v.get("subtype").and_then(Value::as_str) == Some("error_max_turns")
@@ -601,165 +518,11 @@ fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `fork` resumes into a new session with that id instead of appending to
-/// the resumed one (`--fork-session`): cache-keepalive probes
-/// ([`crate::keepalive`]) use it so the real session's leaf never moves.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_native(
-    turn: &PreparedTurn,
-    extra: &Value,
-    system: &str,
-    effort: Option<&str>,
-    timeout: std::time::Duration,
-    frames: &[Value],
-    resume: Option<&ResumePoint>,
-    fork: Option<&str>,
-) -> Result<Vec<Value>, String> {
-    let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let extra_s = extra.to_string();
-    // Per-content name: concurrent turns with different tool sets must not
-    // race on one settings file.
-    let settings_path = tempfile_stage()?.join(format!("settings-{:016x}.json", hash_of(&extra_s)));
-    session::write_atomic(
-        &settings_path,
-        json!({"env": {"CLAUDE_CODE_EXTRA_BODY": extra_s}})
-            .to_string()
-            .as_bytes(),
-    )
-    .map_err(|e| format!("staging settings.json: {e}"))?;
-    let mut argv: Vec<String> = vec![
-        "-p".into(),
-        "--model".into(),
-        turn.native_model.clone(),
-        "--input-format".into(),
-        "stream-json".into(),
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-        "--include-partial-messages".into(),
-        "--tools".into(),
-        String::new(),
-        "--system-prompt".into(),
-        system.to_string(),
-        "--settings".into(),
-        settings_path.to_string_lossy().into_owned(),
-        "--setting-sources".into(),
-        String::new(),
-        "--strict-mcp-config".into(),
-        "--disable-slash-commands".into(),
-        // One turn: a tool_use ends the native run; the host executes the
-        // call and the result returns as a new frame next turn.
-        "--max-turns".into(),
-        "1".into(),
-        "--permission-mode".into(),
-        "dontAsk".into(),
-        "--mcp-config".into(),
-        json!({"mcpServers": {}}).to_string(),
-    ];
-    if let Some((sid, uuid)) = resume {
-        argv.extend([
-            "--resume".into(),
-            sid.clone(),
-            "--resume-session-at".into(),
-            uuid.clone(),
-        ]);
-        if let Some(new_sid) = fork {
-            argv.extend([
-                "--fork-session".into(),
-                "--session-id".into(),
-                new_sid.to_string(),
-            ]);
-        }
-    }
-    if let Some(e) = effort.filter(|e| *e != "off") {
-        argv.push("--effort".into());
-        argv.push(e.to_string());
-    }
-    let mut child = std::process::Command::new(&binary)
-        .args(&argv)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .envs(setup::child_env())
-        .env("ENABLE_TOOL_SEARCH", "false")
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-        .env("DISABLE_AUTO_COMPACT", "1")
-        .env("DISABLE_COMPACT", "1")
-        .env("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off")
-        // A turn must never pop a browser out of a stale login.
-        .env("BROWSER", "/bin/true")
-        .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
-        .spawn()
-        .map_err(|_| setup::INSTALL_HINT.to_string())?;
-    let debug = std::env::var_os("CLAUDE_SUB_DEBUG").is_some();
-    let mut sent: Vec<Value> = Vec::new();
-    let mut stdin_closed = false;
-    if debug {
-        if let Some(new_sid) = fork {
-            sent.push(json!({"keepalive": true, "fork": new_sid}));
-        }
-        if let Some((sid, uuid)) = resume {
-            sent.push(json!({"resume": sid, "at": uuid}));
-        }
-    }
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "native stdin unavailable".to_string())?;
-        for (i, frame) in frames.iter().enumerate() {
-            let mut f = frame.clone();
-            if frame.get("type").and_then(Value::as_str) == Some("user") && i + 1 < frames.len() {
-                f["shouldQuery"] = json!(false);
-            }
-            if debug {
-                sent.push(f.clone());
-            }
-            let line = serde_json::to_string(&f).map_err(|e| format!("frame encode: {e}"))? + "\n";
-            if stdin.write_all(line.as_bytes()).is_err() {
-                // Native exited early (e.g. a refused resume): judge its
-                // output below instead of masking it as a pipe error.
-                stdin_closed = true;
-                break;
-            }
-        }
-    }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "native stdout unavailable".to_string())?;
-    let lines = match read_lines(stdout, timeout) {
-        Ok(l) => l,
-        Err(e) => {
-            // Never leave a timed-out native run writing to its session.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
-    };
-    // Persisted sessions are ours to sweep, whatever the outcome.
-    if let Some(sid) = lines
-        .iter()
-        .find_map(|v| v.get("session_id").and_then(Value::as_str))
-    {
-        session::adopt(sid);
-    }
-    if debug {
-        dump_debug(&sent, &lines);
-    }
-    let status = child.wait().map_err(|e| format!("native wait: {e}"))?;
-    judge(&lines, status.success())?;
-    if stdin_closed {
-        return Err("native stdin closed".into());
-    }
-    Ok(lines)
-}
-
 const API_ERROR: &str = "native API error ";
 
-/// Split a [`run_native`] upstream rejection into the HTTP status the relay
-/// should answer with and the native message. `None` for everything else.
+/// Split an upstream rejection (a judged `API_ERROR` line) into the HTTP
+/// status the relay should answer with and the native message. `None`
+/// for everything else.
 pub fn api_error(detail: &str) -> Option<(u16, &str)> {
     let (code, text) = detail.strip_prefix(API_ERROR)?.split_once(": ")?;
     let code: u16 = code.parse().ok().filter(|c| (400..600).contains(c))?;
@@ -779,7 +542,7 @@ fn hash_of(s: &str) -> u64 {
 /// (native snapshots it on the first request) and the conversation as the
 /// host sees it. Thinking and partial-message splits don't project, so a
 /// carrier that failed to restore still keys the same.
-fn resume_key(turn: &PreparedTurn, system: &str, frames: &[Value]) -> u64 {
+pub(crate) fn resume_key(turn: &PreparedTurn, system: &str, frames: &[Value]) -> u64 {
     let mut runs: Vec<(String, Vec<String>)> = Vec::new();
     for f in frames {
         let role = f
@@ -813,96 +576,12 @@ fn resume_key(turn: &PreparedTurn, system: &str, frames: &[Value]) -> u64 {
     hash_of(&json!([cwd, turn.native_model, system, runs]).to_string())
 }
 
-/// CLAUDE_SUB_DEBUG=1 dump: the frames sent to native and the stream-json
-/// lines received, to /tmp/claude-sub-<pid>-<seq>.ndjson mode 0600.
-fn dump_debug(sent: &[Value], lines: &[Value]) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("claude-sub-{}-{seq}.ndjson", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let Ok(mut f) = opts.open(&path) else {
-        return;
-    };
-    use std::io::Write;
-    for v in sent {
-        let _ = writeln!(f, "sent {}", serde_json::to_string(v).unwrap_or_default());
-    }
-    for v in lines {
-        let _ = writeln!(f, "recv {}", serde_json::to_string(v).unwrap_or_default());
-    }
-}
-
-fn tempfile_stage() -> Result<std::path::PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("claude-sub-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("staging dir: {e}"))?;
-    Ok(dir)
-}
-
-fn read_lines(
-    stdout: std::process::ChildStdout,
-    timeout: std::time::Duration,
-) -> Result<Vec<Value>, String> {
-    use std::io::BufRead;
-    // Lines arrive over a channel so the deadline is real: `BufRead::lines`
-    // blocks between lines, and a silent child (sitting out a usage-limit
-    // window, stuck in its own retry loop) would otherwise park the turn
-    // forever — the old per-line check only fired when a line arrived. On
-    // timeout the caller kills the child; the reader thread then sees EOF.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            if tx.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let mut out = Vec::new();
-    loop {
-        let line =
-            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-                Ok(Ok(line)) => line,
-                Ok(Err(e)) => return Err(format!("native stdout: {e}")),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    return Err("Claude request timed out".into());
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = serde_json::from_str(line).map_err(|_| {
-            format!(
-                "invalid native stream-json output: {:?}",
-                line.chars().take(300).collect::<String>()
-            )
-        })?;
-        // A rejected rate-limit event means the CLI stopped answering and
-        // is sitting out its window: surface the reset now instead of
-        // parking the turn until the child gives up (or the deadline).
-        if let Some(msg) = rate_limit_rejection(&v) {
-            return Err(msg);
-        }
-        out.push(v);
-    }
-    Ok(out)
-}
-
 /// A `rate_limit_event` that means the CLI is waiting out its window, not
 /// answering: `{"status": "rejected", "resetsAt", "rateLimitType"}`.
 /// `allowed`/`allowed_warning` pass through; an unknown status doesn't
 /// qualify (the run's own result line judges it at the end). Shaped like
 /// an [`API_ERROR`] so the relay reports the 429, not a generic failure.
-fn rate_limit_rejection(v: &Value) -> Option<String> {
+pub(crate) fn rate_limit_rejection(v: &Value) -> Option<String> {
     if v.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
         return None;
     }

@@ -5,7 +5,7 @@
 //! `~/.cache/claude-sub/resume/<key>`. When no resume point matches, the
 //! history is written as a synthetic transcript and resumed instead of being
 //! replayed over stdin (stdin replay detaches every historical tool_result
-//! from its tool_use; see `chat::spawn_turn`).
+//! from its tool_use; see `live::spawn_conversation`).
 //!
 //! Everything here is best-effort: a lost or unreadable file only costs a
 //! re-synthesis, never a failed turn. Files we create are swept once idle

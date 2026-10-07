@@ -15,7 +15,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use claude_sub::{catalog, keepalive, manifest, models, relay, setup};
+use claude_sub::{catalog, keepalive, live, manifest, mcp, models, relay, setup};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -52,8 +52,15 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&manifest::manifest())?);
         return Ok(());
     }
+    // `claude` spawns `claude-sub mcp <sock>` to reach the `gray` MCP
+    // server a live session bound ([`mcp::bridge_main`]): a plain pipe
+    // between its stdio and the unix socket.
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        let sock = std::env::args().nth(2).unwrap_or_default();
+        std::process::exit(mcp::bridge_main(&sock));
+    }
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
-    // Re-warm resumed sessions before their ~1h prompt-cache entry lapses.
+    // Re-warm live sessions before their ~1h prompt-cache entry lapses.
     keepalive::start();
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
@@ -88,9 +95,13 @@ async fn main() -> anyhow::Result<()> {
         let _ = writeln!(stdout, "{frame}");
         stdout.flush()?;
         if request.method == "plugin/shutdown" {
+            // Live `claude` children are ours to sweep.
+            live::shutdown_all();
             return Ok(());
         }
     }
+    // stdin EOF: the host closed the pipe — the pool goes down with us.
+    live::shutdown_all();
     Ok(())
 }
 

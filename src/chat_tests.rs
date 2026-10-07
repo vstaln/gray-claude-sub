@@ -385,23 +385,6 @@ fn rejected_rate_limit_event_fails_fast() {
 }
 
 #[test]
-fn read_lines_times_out_on_a_silent_child() {
-    // A child that never prints and never exits must hit the deadline:
-    // before the channel-based read, the clock was only re-checked when
-    // a line arrived, so a silent runaway parked the turn forever.
-    let mut child = std::process::Command::new("sleep")
-        .arg("2")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let e = read_lines(stdout, std::time::Duration::from_millis(50)).unwrap_err();
-    assert_eq!(e, "Claude request timed out");
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[test]
 fn judge_honors_api_rejection_on_clean_exit() {
     // A rejected request is a rejection even when the CLI exits 0: it
     // must never degrade to NO_ANSWER (that reads as a refused resume
