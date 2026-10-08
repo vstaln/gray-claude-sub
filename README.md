@@ -1,6 +1,14 @@
-# gray-claude-sub
-
-> **Claude Pro/Max subscription model-provider sidecar plugin for the [gray](https://github.com/vstaln/gray) agent harness.**
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+  <img src="assets/claude.svg" alt="claude" width="96">
+</p>
+<h1 align="center">gray-claude-sub</h1>
+<p align="center">Use your Claude Pro/Max subscription as a model provider — the official `claude` CLI, driven fully inert.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-claude-sub/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
 `gray-claude-sub` drives the official `claude` CLI fully inert (`--tools ''`, no MCP servers, no slash commands, `dontAsk`, no session persistence) as a request-scoped model provider. Gray owns the agent loop, tools, approvals, and compaction — Claude only answers.
 
@@ -9,8 +17,8 @@
 ## Highlights
 
 * **Zero Token / Credential Leaks**: Uses your existing official Claude Code login (`claude auth login`). Never handles, stores, or logs API keys or tokens.
-* **Single-Request Admission Relay**: Drives an internal request-scoped loopback admission relay that enforces exactly one upstream request per turn and absorbs redundant recovery attempts.
-* **Native Assistant Replay Carrier**: Assistant messages round-trip in signed reasoning replay carriers (`NATIVE_ITEM_ID`) so future turns restore byte-identical upstream frames without prompt divergence.
+* **Single-Request Admission Relay**: Drives an internal request-scoped loopback admission relay that enforces exactly one provider request per turn and absorbs redundant recovery attempts.
+* **Native Assistant Replay Carrier**: Assistant messages round-trip in signed reasoning replay carriers (`NATIVE_ITEM_ID`) so future turns restore byte-identical provider frames without prompt divergence.
 * **Pinned Model Catalog**: Exact context windows without guessing (`opus`, `sonnet`, `fable`: 1,000,000 tokens; `haiku`: 200,000 tokens).
 
 ---
@@ -118,7 +126,7 @@ The sidecar communicates over standard I/O using newline-delimited JSON (NDJSON)
 │   ├── models.rs            # Provider model metadata
 │   ├── manifest.rs          # Plugin protocol manifest
 │   ├── setup.rs             # CLI dependency discovery and verification
-└── reference/               # Complete upstream Hermes DirectSDK test & eval suite
+└── reference/               # DirectSDK test & eval suite
 ```
 
 ---
@@ -126,3 +134,7 @@ The sidecar communicates over standard I/O using newline-delimited JSON (NDJSON)
 ## License
 
 MIT License — Copyright (c) 2026 Vstalin Grady
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>
