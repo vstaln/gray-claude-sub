@@ -112,6 +112,109 @@ fn usage_reports_cache_reads_and_writes() {
 }
 
 #[test]
+fn parked_turn_reports_assistant_usage() {
+    // A turn that ends on parked tool calls returns no `result` line —
+    // the query is still open. Usage must come from `message.usage` on
+    // the assistant events, or the host gauge reads 0 the whole turn.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_1",
+                "name": "mcp__gray__bash", "input": {"command": "ls"}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 50}}}),
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_2",
+                "name": "mcp__gray__bash", "input": {"command": "ls -la"}}],
+            "usage": {"input_tokens": 12, "output_tokens": 7,
+                "cache_read_input_tokens": 1060,
+                "cache_creation_input_tokens": 0}}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let names = vec!["bash".to_string()];
+    let (sse, _, _, _, usage, _) = fold_lines(&lines, &names, &say).unwrap();
+    // The last assistant report is the current context size.
+    assert_eq!(usage.input_tokens, 12 + 1060);
+    assert_eq!(usage.output_tokens, 7);
+    assert_eq!(usage.cached_tokens, 1060);
+    let s = String::from_utf8(sse).unwrap();
+    assert!(s.contains("\"input_tokens\":1072"), "{s}");
+}
+
+#[test]
+fn settled_turn_reads_result_usage_over_midstream_snapshots() {
+    // Assistant events stamp a mid-stream snapshot — `output_tokens`
+    // there is the few tokens generated when the block landed, not the
+    // message total. A turn judged on the last snapshot prints ~2 tokens
+    // and 0 tps; the `result` line that closes the drain is the truth.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "thinking"}],
+            "usage": {"input_tokens": 2, "output_tokens": 6,
+                "cache_read_input_tokens": 8368,
+                "cache_creation_input_tokens": 18471}}}),
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 2, "output_tokens": 6,
+                "cache_read_input_tokens": 8368,
+                "cache_creation_input_tokens": 18471}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 2, "output_tokens": 119,
+                "cache_read_input_tokens": 8368,
+                "cache_creation_input_tokens": 18471,
+                "iterations": [{"type": "message", "input_tokens": 2,
+                    "output_tokens": 119, "cache_read_input_tokens": 8368,
+                    "cache_creation_input_tokens": 18471}]}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (_, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.output_tokens, 119);
+    assert_eq!(usage.input_tokens, 2 + 8368 + 18471);
+    assert_eq!(usage.cached_tokens, 8368);
+}
+
+#[test]
+fn result_usage_takes_last_iteration_not_the_top_level_sum() {
+    // A call-parked query resumes on a second upstream request; the
+    // `result` top level sums both legs. The last iteration alone is the
+    // live context size and this drain's output.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {"input_tokens": 2, "output_tokens": 4,
+                "cache_read_input_tokens": 160000,
+                "cache_creation_input_tokens": 100}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 4, "output_tokens": 700,
+                "cache_read_input_tokens": 321000,
+                "cache_creation_input_tokens": 200,
+                "iterations": [
+                    {"type": "message", "input_tokens": 2,
+                        "output_tokens": 500, "cache_read_input_tokens": 160000,
+                        "cache_creation_input_tokens": 100},
+                    {"type": "message", "input_tokens": 2,
+                        "output_tokens": 200, "cache_read_input_tokens": 161000,
+                        "cache_creation_input_tokens": 100}]}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (_, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.output_tokens, 200);
+    assert_eq!(usage.input_tokens, 2 + 161000 + 100);
+}
+
+#[test]
+fn result_usage_fills_when_no_assistant_report() {
+    let lines = vec![json!({"type": "result", "subtype": "success",
+        "is_error": false,
+        "usage": {"input_tokens": 4, "output_tokens": 3,
+            "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50}})];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (_, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.input_tokens, 154);
+    assert_eq!(usage.cached_tokens, 100);
+}
+
+#[test]
 fn fold_emits_valid_responses_sse() {
     let lines = vec![
         json!({"type": "assistant", "message": {"role": "assistant",
@@ -132,6 +235,39 @@ fn fold_emits_valid_responses_sse() {
     assert!(s.contains("response.output_item.done"));
     assert!(s.contains("response.completed"));
     assert!(s.ends_with("data: [DONE]\n\n"));
+}
+
+#[test]
+fn fold_separates_text_blocks_with_a_blank_line() {
+    // [text][thinking][text] in one message, then a second assistant
+    // message: the blocks are paragraphs, not one run-on sentence.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [
+                {"type": "text", "text": "one."},
+                {"type": "thinking", "thinking": "hmm", "signature": "s"},
+                {"type": "text", "text": "Two."}]}}),
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "three"}]}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 1, "output_tokens": 1}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (sse, _, text, _, _, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(text, "one.\n\nTwo.\n\nthree");
+    let s = String::from_utf8(sse).unwrap();
+    assert!(s.contains("\"delta\":\"one.\\n\\nTwo.\\n\\nthree\""), "{s}");
+}
+
+#[test]
+fn text_of_joins_text_parts_with_a_blank_line() {
+    let v = json!([
+        {"type": "output_text", "text": "a"},
+        {"type": "output_text", "text": ""},
+        {"type": "text", "text": "b"},
+    ]);
+    assert_eq!(text_of(&v), "a\n\nb");
+    assert_eq!(text_of(&json!("plain")), "plain");
 }
 
 #[test]

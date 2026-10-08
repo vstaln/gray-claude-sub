@@ -79,6 +79,20 @@ fn check_tool_name(name: &str, seen: &HashSet<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// One visible text block folded into a message's text. Blocks are
+/// paragraphs, not run-on continuations — `text_of`, [`fold_lines`]
+/// accumulation and [`crate::live`]'s echo matching all share this
+/// separator or a replayed answer would never equal its echo.
+pub(crate) fn push_text(acc: &mut String, t: &str) {
+    if t.is_empty() {
+        return;
+    }
+    if !acc.is_empty() {
+        acc.push_str("\n\n");
+    }
+    acc.push_str(t);
+}
+
 pub(crate) fn text_of(blocks: &Value) -> String {
     match blocks {
         Value::String(s) => s.clone(),
@@ -90,8 +104,9 @@ pub(crate) fn text_of(blocks: &Value) -> String {
                 Some("input_text" | "output_text") => b.get("text").and_then(Value::as_str),
                 _ => None,
             })
+            .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
-            .join(""),
+            .join("\n\n"),
         _ => String::new(),
     }
 }
@@ -632,6 +647,14 @@ pub fn fold_lines(
     let mut text = String::new();
     let mut calls: Vec<(String, String, String)> = Vec::new();
     let mut natives: Vec<Value> = Vec::new();
+    // Usage reports ride `message.usage` on assistant events and `usage`
+    // on `result`; both write the same slot so the last report in stream
+    // order wins. The ordering is load-bearing: a settled turn ends on
+    // `result`, the only report whose `output_tokens` is final (assistant
+    // snapshots are stamped mid-stream — judged on one, a whole turn
+    // reads ~2 output tokens and 0 tps), while a drain folding a deferred
+    // `result` then fresh assistant events keeps the newer partial
+    // instead of misattributing the old query's summary to the new one.
     let mut usage = Usage::default();
     let mut stop = "completed".to_string();
     let mut sse = Vec::new();
@@ -674,6 +697,11 @@ pub fn fold_lines(
                 }
                 if let Some(msg) = line.get("message") {
                     natives.push(msg.clone());
+                    // Latest call wins: each report carries that call's
+                    // full prompt size, which is what the gauge shows.
+                    if let Some(u) = msg.get("usage") {
+                        usage = map_usage(u);
+                    }
                     if let Some(blocks) = msg.get("content").and_then(Value::as_array) {
                         for b in blocks {
                             match b.get("type").and_then(Value::as_str) {
@@ -682,7 +710,11 @@ pub fn fold_lines(
                                         // Progress, not stream: the host replays
                                         // the full text at finalize.
                                         say(format!("…{t}"));
-                                        text.push_str(t);
+                                        // Distinct blocks (across a thinking
+                                        // block or a new message) are
+                                        // paragraphs — bare concat glues the
+                                        // last word of one onto the next.
+                                        push_text(&mut text, t);
                                     }
                                 }
                                 // Thinking stays inside the native carrier:
@@ -728,7 +760,7 @@ pub fn fold_lines(
             }
             "result" => {
                 if let Some(u) = line.get("usage") {
-                    usage = map_usage(u);
+                    usage = map_result_usage(u);
                 }
                 let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or("");
                 let is_error = line
@@ -851,6 +883,23 @@ pub struct Usage {
     pub cached_tokens: usize,
     /// `cache_creation_input_tokens` — a subset of `input_tokens`.
     pub cache_write_tokens: usize,
+}
+
+/// `result` usage is the settled query's truth where assistant snapshots
+/// are mid-stream: its `output_tokens` is final. `iterations` lists every
+/// upstream request the query made (a call-parked query resumes on a
+/// second one, and the top level sums the legs — input read there would
+/// double the live context size), so the last entry's report is the
+/// request this drain actually settled on.
+fn map_result_usage(u: &Value) -> Usage {
+    match u
+        .get("iterations")
+        .and_then(Value::as_array)
+        .and_then(|a| a.last())
+    {
+        Some(last) => map_usage(last),
+        None => map_usage(u),
+    }
 }
 
 pub fn map_usage(u: &Value) -> Usage {

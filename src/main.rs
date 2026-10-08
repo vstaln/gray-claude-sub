@@ -6,7 +6,7 @@
 //!
 //! Wire (NDJSON over stdio, host ids are opaque):
 //! - `plugin/manifest` → manifest + the `claude-subscription` provider decl.
-//! - `provider/models` → pinned catalog (no HTTP endpoint exists).
+//! - `provider/models` → live `/v1/models` discovery, pinned fallback.
 //! - `provider/chat` → one relayed turn (declares the per-turn relay URL +
 //!   bearer the host's standard Responses POST must use).
 //! - `provider/auth/*` → the user's own `claude auth login` owns
@@ -170,7 +170,7 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             ensure_provider(provider, auth_method)?;
-            Ok(serde_json::to_value(models::catalog()).unwrap())
+            Ok(serde_json::to_value(models::catalog().await).unwrap())
         }
         "provider/chat" => chat_turn(relays, params).await,
         "plugin/shutdown" => Ok(json!({})),
@@ -223,6 +223,10 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
             setup::LoginState::Unknown => {}
         }
     }
+    // Warm the model snapshot once per process so alias resolution below
+    // (and in the turn pipeline) sees live ids even when the host skips
+    // `provider/models`. A failed fetch is a no-op — fallback answers.
+    let _ = catalog::snapshot().await;
     let bearer = format!("claude-sub-{}", hex_id());
     // The relay server is per-turn: bind now so the host gets a live port.
     // The admitted POST carries the Responses body; the handler translates,

@@ -676,6 +676,7 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "gray-plugin",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

@@ -252,7 +252,7 @@ fn continuation<'a>(
     }
     let undelivered = i == 0 && (!reply_call_ids.is_empty() || !reply_text.trim().is_empty());
     if !undelivered
-        && (call_ids.as_slice() != reply_call_ids || texts.join("\n").trim() != reply_text.trim())
+        && (call_ids.as_slice() != reply_call_ids || texts.join("\n\n").trim() != reply_text.trim())
     {
         return Err("echo");
     }
@@ -787,7 +787,7 @@ impl LiveSession {
                                 && s.get("status").and_then(Value::as_str) != Some("connected")
                         });
                     if failed {
-                        return Err("gray MCP server failed to connect".into());
+                        return Err(MCP_MOUNT_FAILED.to_string());
                     }
                 }
             }
@@ -1083,7 +1083,7 @@ fn echo_of(lines: &[Value], names: &[String]) -> (Vec<String>, String) {
             match b.get("type").and_then(Value::as_str) {
                 Some("text") => {
                     if let Some(t) = b.get("text").and_then(Value::as_str) {
-                        text.push_str(t);
+                        chat::push_text(&mut text, t);
                     }
                 }
                 Some("tool_use") => {
@@ -1102,6 +1102,12 @@ fn echo_of(lines: &[Value], names: &[String]) -> (Vec<String>, String) {
     }
     (ids, text)
 }
+
+/// `system/init` reporting the `gray` stdio mount failed is a spawn-time
+/// flake — the child's `claude-sub mcp` shim never connected or claude's
+/// handshake timed out — not a verdict on the session. The failed child
+/// closes itself, so one respawn on a fresh socket almost always mounts.
+const MCP_MOUNT_FAILED: &str = "gray MCP server failed to connect";
 
 /// Spawn a live child: bind the `gray` socket, write `tail` frames into
 /// it, drain to the boundary. The caller owns judge/tier semantics.
@@ -1269,7 +1275,7 @@ fn spawn_conversation(
             &synthetic as &dyn Fn() -> Option<ResumePoint>,
         ] {
             let Some(at) = at() else { continue };
-            match spawn_live(turn, tools.clone(), effort, Some(&at), tail, deadline) {
+            match spawn_live_retried(turn, tools.clone(), effort, Some(&at), tail, deadline) {
                 // A refused resume ends Done with an error result and no
                 // assistant line — judge reads it as NO_ANSWER and the
                 // child is a dead end: kill and advance the tier.
@@ -1286,7 +1292,23 @@ fn spawn_conversation(
             }
         }
     }
-    spawn_live(turn, tools, effort, None, frames, deadline)
+    spawn_live_retried(turn, tools, effort, None, frames, deadline)
+}
+
+/// One respawn on a fresh socket when the child's `gray` MCP mount failed
+/// at init — a spawn-time flake, retried once, never looping.
+fn spawn_live_retried(
+    turn: &PreparedTurn,
+    tools: Vec<Value>,
+    effort: Option<&str>,
+    resume: Option<&ResumePoint>,
+    tail: &[Value],
+    deadline: Instant,
+) -> Result<(LiveSession, Term, Vec<Value>), String> {
+    match spawn_live(turn, tools.clone(), effort, resume, tail, deadline) {
+        Err(e) if e == MCP_MOUNT_FAILED => spawn_live(turn, tools, effort, resume, tail, deadline),
+        r => r,
+    }
 }
 
 /// Record where this conversation now lives (the session plus the
@@ -1526,5 +1548,60 @@ fn finish_spawn(
             give_back(s);
             Ok(lines)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn echo_records_what_fold_sent() {
+        // `reply_text` feeds next turn's continuation match, so it must be
+        // the same text the host saw — block separators included, or every
+        // continuation misses and respawns.
+        let lines = vec![
+            json!({"type": "assistant", "message": {"role": "assistant",
+                "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "tool_use", "id": "c1",
+                        "name": "mcp__gray__bash", "input": {"command": "ls"}},
+                    {"type": "text", "text": "b"}]}}),
+            json!({"type": "result", "subtype": "success", "is_error": false}),
+        ];
+        let names = vec!["bash".to_string()];
+        let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+        let (_, _, folded, _, _, _) = chat::fold_lines(&lines, &names, &say).unwrap();
+        let (ids, reply_text) = echo_of(&lines, &names);
+        assert_eq!(ids, vec!["c1".to_string()]);
+        assert_eq!(reply_text, folded);
+        assert_eq!(reply_text, "a\n\nb");
+    }
+
+    #[test]
+    fn continuation_accepts_the_replayed_echo() {
+        // The host replays the absorbed prefix, the assistant message it
+        // saw (one item, whole text), the call + its output, then the new
+        // user tail.
+        let absorbed = vec![json!({"role": "user", "content": "hi"})];
+        let input = vec![
+            absorbed[0].clone(),
+            json!({"role": "assistant",
+                "content": [{"type": "output_text", "text": "a\n\nb"}]}),
+            json!({"type": "function_call", "call_id": "c1",
+                "name": "bash", "arguments": "{}"}),
+            json!({"type": "function_call_output",
+                "call_id": "c1", "output": "out"}),
+            json!({"role": "user", "content": "next"}),
+        ];
+        let (tail, undelivered) =
+            continuation(&absorbed, &["c1".to_string()], "a\n\nb", &input).unwrap();
+        assert!(!undelivered);
+        assert_eq!(tail.len(), 2, "{tail:?}");
+        // A glued echo (the old text_of would have produced it) misses.
+        assert_eq!(
+            continuation(&absorbed, &["c1".to_string()], "ab", &input),
+            Err("echo")
+        );
     }
 }
