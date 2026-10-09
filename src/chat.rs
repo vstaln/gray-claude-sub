@@ -531,6 +531,29 @@ pub(crate) fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
         if let Some((code, text)) = api {
             return Err(format!("{API_ERROR}{code}: {text}"));
         }
+        // Any other failed result is a real failure, not "no answer" —
+        // unless it is the refused-`--resume` signature (a zero-turn error
+        // result with no assistant and no API markers), which spent no
+        // request and may advance a tier. Everything else surfaces its own
+        // sentence so a burned request is never replayed or mislabeled.
+        let refused = |v: &Value| {
+            v.get("num_turns").and_then(Value::as_u64).unwrap_or(0) == 0
+                && v.get("api_error").map_or(true, |a| a.is_null())
+        };
+        let saw_answer = lines.iter().any(|v| is(v, "assistant"));
+        if let Some(v) = lines.iter().rev().find(|v| {
+            is(v, "result") && v.get("is_error").and_then(Value::as_bool) == Some(true)
+        }) {
+            if saw_answer || !refused(v) {
+                let detail = v
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| v.get("subtype").and_then(Value::as_str))
+                    .unwrap_or("upstream rejected the request");
+                return Err(format!("native request failed: {detail}"));
+            }
+        }
     }
     if !lines.iter().any(|v| is(v, "result")) || !lines.iter().any(|v| is(v, "assistant")) {
         return Err(format!("{NO_ANSWER}: assistant and one result required"));

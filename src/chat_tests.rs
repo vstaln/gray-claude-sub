@@ -566,6 +566,39 @@ fn refused_resume_moves_on_but_rate_limit_does_not() {
 }
 
 #[test]
+fn failed_result_surfaces_its_own_sentence_not_no_answer() {
+    // error_during_execution after a spent turn (num_turns > 0), no API
+    // status: a real failure — never the refused-resume "no answer".
+    let mid_fail = vec![
+        answer("claude-sonnet-5"),
+        result(json!({"subtype": "error_during_execution", "is_error": true,
+            "num_turns": 1, "result": "boom"})),
+    ];
+    let e = judge(&mid_fail, true).unwrap_err();
+    assert_eq!(e, "native request failed: boom");
+    assert!(!replay_after_failed_resume(&e));
+
+    // Same failure without an assistant line still surfaces the reason.
+    let e = judge(&mid_fail[1..], true).unwrap_err();
+    assert_eq!(e, "native request failed: boom");
+    assert!(!replay_after_failed_resume(&e));
+
+    // A zero-turn error result with no assistant stays the refused
+    // resume: NO_ANSWER keeps the tier-advance working.
+    let refused = vec![result(json!({"subtype": "error_during_execution",
+        "is_error": true, "num_turns": 0}))];
+    let e = judge(&refused, false).unwrap_err();
+    assert!(replay_after_failed_resume(&e), "{e}");
+
+    // An api_error marker without a status is a rejection, not a refusal.
+    let rejected = vec![result(json!({"is_error": true, "num_turns": 0,
+        "api_error": "usage_limit_reached", "result": "limit"}))];
+    let e = judge(&rejected, false).unwrap_err();
+    assert_eq!(e, "native request failed: limit");
+    assert!(!replay_after_failed_resume(&e));
+}
+
+#[test]
 fn judge_accepts_answers_and_the_tool_boundary() {
     assert!(judge(&[answer("claude-sonnet-5"), result(json!({}))], true).is_ok());
     // --max-turns 1 ends a tool call with a nonzero exit.
