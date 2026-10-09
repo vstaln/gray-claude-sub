@@ -1,6 +1,6 @@
 [package]
 name = "gray-claude-sub"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Claude subscription provider sidecar plugin for the gray agent harness"
@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+gray-core = { git = "https://github.com/vstaln/gray.git" }
 gray-plugin = { git = "https://github.com/vstaln/gray.git" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

@@ -12,6 +12,9 @@
 //! - `provider/auth/*` → the user's own `claude auth login` owns
 //!   credentials; start/poll report external-login status, refresh/revoke
 //!   are unsupported.
+//! - `command/run` → a bare `/claude` answers nothing so the host's
+//!   provider-login shortcut switches the session to Claude, and
+//!   `/claude tools …` owns the upstream tool allowlist (`{"text": …}`).
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
@@ -58,6 +61,13 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("mcp") {
         let sock = std::env::args().nth(2).unwrap_or_default();
         std::process::exit(mcp::bridge_main(&sock));
+    }
+    // `gray claude-sub tools …` and the REPL's `/claude tools …` land on
+    // the same file: one allowlist, no sidecar needed.
+    if std::env::args().nth(1).as_deref() == Some("tools") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        println!("{}", claude_sub::settings::tools_command(&args));
+        return Ok(());
     }
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     // Re-warm live sessions before their ~1h prompt-cache entry lapses.
@@ -173,6 +183,23 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             Ok(serde_json::to_value(models::catalog().await).unwrap())
         }
         "provider/chat" => chat_turn(relays, params).await,
+        "command/run" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let argv: Vec<String> = params
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            manifest::run_command(name, &argv)
+                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".into()))
+        }
         "plugin/shutdown" => Ok(json!({})),
         _ => Err(ProviderRpcError::Protocol("unknown provider method".into())),
     }

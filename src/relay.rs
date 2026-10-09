@@ -246,12 +246,16 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
     // writes only its delta into the pooled child; tool calls park inside
     // the child's `gray` MCP server until a later turn answers them.
     let lines = crate::live::run_turn(&body, &intent.model, effort, Duration::from_secs(300))?;
+    // The fold's inventory is the advertised set, not the raw request:
+    // `/claude tools` narrows what the model may call upstream.
+    let policy = crate::settings::ToolPolicy::load();
     let names: Vec<String> = body
         .get("tools")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
+        .filter(|n| policy.allows(n))
         .collect();
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
     let (sse, _, _, _, _, _) = crate::chat::fold_lines(&lines, &names, &say)?;

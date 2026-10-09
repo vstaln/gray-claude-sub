@@ -672,9 +672,10 @@ dependencies = [
 
 [[package]]
 name = "gray-claude-sub"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "gray-core",
  "gray-plugin",
  "reqwest",
  "serde",

@@ -9,6 +9,8 @@ pub const PLUGIN_NAME: &str = "claude-sub";
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROVIDER_ID: &str = "claude-subscription";
 pub const AUTH_METHOD_ID: &str = "claude-login";
+/// The operator command: `/claude tools …` owns the tool allowlist.
+pub const CLAUDE_COMMAND: &str = "/claude";
 
 /// A protocol-1.2 manifest value. Credentials stay with the user's own
 /// `claude auth login`: the `external-login` method performs no OAuth, it
@@ -18,7 +20,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         tools: Vec::new(),
-        commands: vec!["/claude".to_string()],
+        commands: vec![CLAUDE_COMMAND.to_string()],
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
@@ -29,6 +31,24 @@ pub fn manifest() -> gray_plugin::Manifest {
         providers: vec![provider()],
         provider_errors: Vec::new(),
     }
+}
+
+/// `command/run` result for a claimed command, `None` for names this
+/// sidecar doesn't answer. A bare `/claude` answers nothing (`{}`) so the
+/// host falls back to the provider-login shortcut — connect → model
+/// picker on Claude's rows, i.e. "switch to Claude" — while
+/// `/claude tools …` owns the tool allowlist (see [`crate::settings`]),
+/// answered as `{"text": …}`.
+pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
+    if name == CLAUDE_COMMAND {
+        if argv.is_empty() {
+            return Some(serde_json::json!({}));
+        }
+        return Some(serde_json::json!({
+            "text": crate::settings::command(argv),
+        }));
+    }
+    None
 }
 
 /// Claude subscription provider. Requests go to the loopback relay the
