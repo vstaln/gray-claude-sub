@@ -1,0 +1,6 @@
+[build]
+# Repo-scoped parallelism, so a build here does not depend on the
+# contributor's machine-wide ~/.cargo/config.toml. 6 keeps typical rustc
+# RSS inside RAM on a loaded desktop; override per run with
+# CARGO_BUILD_JOBS (an env var wins over this file).
+jobs = 6
