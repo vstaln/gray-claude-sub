@@ -541,9 +541,11 @@ pub(crate) fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
                 && v.get("api_error").map_or(true, |a| a.is_null())
         };
         let saw_answer = lines.iter().any(|v| is(v, "assistant"));
-        if let Some(v) = lines.iter().rev().find(|v| {
-            is(v, "result") && v.get("is_error").and_then(Value::as_bool) == Some(true)
-        }) {
+        if let Some(v) = lines
+            .iter()
+            .rev()
+            .find(|v| is(v, "result") && v.get("is_error").and_then(Value::as_bool) == Some(true))
+        {
             if saw_answer || !refused(v) {
                 let detail = v
                     .get("result")

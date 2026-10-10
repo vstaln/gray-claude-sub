@@ -571,8 +571,10 @@ fn failed_result_surfaces_its_own_sentence_not_no_answer() {
     // status: a real failure — never the refused-resume "no answer".
     let mid_fail = vec![
         answer("claude-sonnet-5"),
-        result(json!({"subtype": "error_during_execution", "is_error": true,
-            "num_turns": 1, "result": "boom"})),
+        result(
+            json!({"subtype": "error_during_execution", "is_error": true,
+            "num_turns": 1, "result": "boom"}),
+        ),
     ];
     let e = judge(&mid_fail, true).unwrap_err();
     assert_eq!(e, "native request failed: boom");
