@@ -687,6 +687,10 @@ pub fn fold_lines(
     // `result` then fresh assistant events keeps the newer partial
     // instead of misattributing the old query's summary to the new one.
     let mut usage = Usage::default();
+    // The last upstream request's own report, kept apart from `usage`
+    // so a `result` without `iterations` can take the request's input
+    // without the turn-wide sum (see map_result_usage).
+    let mut request_usage: Option<Usage> = None;
     let mut stop = "completed".to_string();
     let mut sse = Vec::new();
     let mut sse_text = String::new();
@@ -732,6 +736,7 @@ pub fn fold_lines(
                     // full prompt size, which is what the gauge shows.
                     if let Some(u) = msg.get("usage") {
                         usage = map_usage(u);
+                        request_usage = Some(usage.clone());
                     }
                     if let Some(blocks) = msg.get("content").and_then(Value::as_array) {
                         for b in blocks {
@@ -791,7 +796,7 @@ pub fn fold_lines(
             }
             "result" => {
                 if let Some(u) = line.get("usage") {
-                    usage = map_result_usage(u);
+                    usage = map_result_usage(u, request_usage.as_ref());
                 }
                 let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or("");
                 let is_error = line
@@ -917,19 +922,33 @@ pub struct Usage {
 }
 
 /// `result` usage is the settled query's truth where assistant snapshots
-/// are mid-stream: its `output_tokens` is final. `iterations` lists every
-/// upstream request the query made (a call-parked query resumes on a
-/// second one, and the top level sums the legs — input read there would
-/// double the live context size), so the last entry's report is the
-/// request this drain actually settled on.
-fn map_result_usage(u: &Value) -> Usage {
-    match u
+/// are mid-stream: its `output_tokens` is final. Input is different: the
+/// gauge needs one request's prompt size. When `result` lists
+/// `iterations`, the last entry is the request the drain settled on (a
+/// call-parked query resumes on a second upstream request, and the top
+/// level sums the legs). Without `iterations` the top level is the sum of
+/// every leg, so the input comes from the last assistant report instead.
+/// Reading the sum as the gauge made a multi-request turn look like
+/// millions of tokens, which forced compaction on every such turn.
+/// Output still comes from the top level: it is final and is the whole
+/// turn's count, which keeps billed output complete.
+fn map_result_usage(u: &Value, last_request: Option<&Usage>) -> Usage {
+    if let Some(last) = u
         .get("iterations")
         .and_then(Value::as_array)
         .and_then(|a| a.last())
     {
-        Some(last) => map_usage(last),
-        None => map_usage(u),
+        return map_usage(last);
+    }
+    let top = map_usage(u);
+    match last_request {
+        Some(req) => Usage {
+            input_tokens: req.input_tokens,
+            output_tokens: top.output_tokens,
+            cached_tokens: req.cached_tokens,
+            cache_write_tokens: req.cache_write_tokens,
+        },
+        None => top,
     }
 }
 

@@ -647,3 +647,33 @@ fn hash_is_stable_across_builds() {
     assert_eq!(hash_of("a"), 0xaf63_dc4c_8601_ec8c);
     assert_eq!(hash_of("foobar"), 0x8594_4171_f739_67e8);
 }
+
+#[test]
+fn result_without_iterations_gauges_the_last_request_not_the_sum() {
+    // Two upstream requests in one query and no `iterations` list: the
+    // top level sums both legs (~321k cache reads, which is what made the
+    // gauge jump). The gauge must be the last request's prompt size.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "step"}],
+            "usage": {"input_tokens": 2, "output_tokens": 4,
+                "cache_read_input_tokens": 160000,
+                "cache_creation_input_tokens": 100}}}),
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {"input_tokens": 2, "output_tokens": 4,
+                "cache_read_input_tokens": 161000,
+                "cache_creation_input_tokens": 100}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 4, "output_tokens": 700,
+                "cache_read_input_tokens": 321000,
+                "cache_creation_input_tokens": 200}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (_, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.input_tokens, 2 + 161000 + 100);
+    assert_eq!(usage.cached_tokens, 161000);
+    assert_eq!(usage.cache_write_tokens, 100);
+    // Output is the turn's final count from `result`.
+    assert_eq!(usage.output_tokens, 700);
+}
