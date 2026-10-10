@@ -600,9 +600,20 @@ impl LiveSession {
             }
             self.send(&f)?;
         }
-        // Exactly one querying frame: prepare_turn guarantees the tail
-        // ends in a user/tool-result message.
-        self.running = 1;
+        // Every `user` frame yields its own `result` event — even a
+        // `shouldQuery:false` replay frame (num_turns:0, empty). Assistant
+        // frames yield init/echo only. `running` must count user frames,
+        // not just the one querying frame: with `1`, the first replayed
+        // frame's empty result ended the drain early and the turn judged
+        // NO_ANSWER, so any conversation with prior history could never
+        // cold-start (found via resume e2e).
+        self.running = frames
+            .iter()
+            .filter(|f| f.get("type").and_then(Value::as_str) == Some("user"))
+            .count();
+        if self.running == 0 {
+            return Err("history contains no user frames".into());
+        }
         Ok(())
     }
 
@@ -817,6 +828,12 @@ impl LiveSession {
                 if let Some(sid) = v.get("session_id").and_then(Value::as_str) {
                     self.sid = sid.to_string();
                 }
+            }
+            Some("rate_limit_event") => {
+                // Subscription-quota telemetry: `unifiedWindows` refreshes
+                // every window at once — write-through to the /usage cache
+                // so quota rows stay warm between probes.
+                crate::usage::note_event(&v);
             }
             _ => {}
         }

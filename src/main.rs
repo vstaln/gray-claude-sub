@@ -18,7 +18,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use claude_sub::{catalog, keepalive, live, manifest, mcp, models, relay, setup};
+use claude_sub::{catalog, keepalive, live, manifest, mcp, models, relay, setup, usage};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Deserialize)]
 struct Request {
+    #[serde(default)]
     id: Value,
     method: String,
     #[serde(default)]
@@ -87,6 +88,13 @@ async fn main() -> anyhow::Result<()> {
             Ok(request) => request,
             Err(_) => continue,
         };
+        if request.id.is_null() {
+            if request.method == "plugin/shutdown" {
+                live::shutdown_all();
+                return Ok(());
+            }
+            continue;
+        }
         let outcome = handle(&relays, &request).await;
         let response = match outcome {
             Ok(result) => Response {
@@ -183,6 +191,18 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             Ok(serde_json::to_value(models::catalog().await).unwrap())
         }
         "provider/chat" => chat_turn(relays, params).await,
+        "provider/usage" => {
+            let provider = params
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let auth_method = params
+                .get("auth_method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            ensure_provider(provider, auth_method)?;
+            usage::handle()
+        }
         "command/run" => {
             let name = params
                 .get("name")
