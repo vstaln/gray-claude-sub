@@ -538,23 +538,22 @@ pub(crate) fn judge(lines: &[Value], exit_ok: bool) -> Result<(), String> {
         // sentence so a burned request is never replayed or mislabeled.
         let refused = |v: &Value| {
             v.get("num_turns").and_then(Value::as_u64).unwrap_or(0) == 0
-                && v.get("api_error").map_or(true, |a| a.is_null())
+                && v.get("api_error").is_none_or(|a| a.is_null())
         };
         let saw_answer = lines.iter().any(|v| is(v, "assistant"));
         if let Some(v) = lines
             .iter()
             .rev()
             .find(|v| is(v, "result") && v.get("is_error").and_then(Value::as_bool) == Some(true))
+            && (saw_answer || !refused(v))
         {
-            if saw_answer || !refused(v) {
-                let detail = v
-                    .get("result")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| v.get("subtype").and_then(Value::as_str))
-                    .unwrap_or("upstream rejected the request");
-                return Err(format!("native request failed: {detail}"));
-            }
+            let detail = v
+                .get("result")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| v.get("subtype").and_then(Value::as_str))
+                .unwrap_or("upstream rejected the request");
+            return Err(format!("native request failed: {detail}"));
         }
     }
     if !lines.iter().any(|v| is(v, "result")) || !lines.iter().any(|v| is(v, "assistant")) {

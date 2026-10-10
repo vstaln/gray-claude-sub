@@ -288,7 +288,7 @@ fn map_usage(r: &Value) -> Value {
         .get("seven_day_breakdown")
         .and_then(|b| b.get("rows"))
         .and_then(Value::as_array)
-        .map(|rows| {
+        .and_then(|rows| {
             let parts: Vec<String> = rows
                 .iter()
                 .filter_map(|r| {
@@ -298,8 +298,7 @@ fn map_usage(r: &Value) -> Value {
                 })
                 .collect();
             (!parts.is_empty()).then(|| format!("weekly split: {}", parts.join(" · ")))
-        })
-        .flatten();
+        });
     let mut limits = json!({
         "available": true,
         "title": "Claude",
