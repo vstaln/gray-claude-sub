@@ -566,6 +566,41 @@ fn refused_resume_moves_on_but_rate_limit_does_not() {
 }
 
 #[test]
+fn failed_result_surfaces_its_own_sentence_not_no_answer() {
+    // error_during_execution after a spent turn (num_turns > 0), no API
+    // status: a real failure — never the refused-resume "no answer".
+    let mid_fail = vec![
+        answer("claude-sonnet-5"),
+        result(
+            json!({"subtype": "error_during_execution", "is_error": true,
+            "num_turns": 1, "result": "boom"}),
+        ),
+    ];
+    let e = judge(&mid_fail, true).unwrap_err();
+    assert_eq!(e, "native request failed: boom");
+    assert!(!replay_after_failed_resume(&e));
+
+    // Same failure without an assistant line still surfaces the reason.
+    let e = judge(&mid_fail[1..], true).unwrap_err();
+    assert_eq!(e, "native request failed: boom");
+    assert!(!replay_after_failed_resume(&e));
+
+    // A zero-turn error result with no assistant stays the refused
+    // resume: NO_ANSWER keeps the tier-advance working.
+    let refused = vec![result(json!({"subtype": "error_during_execution",
+        "is_error": true, "num_turns": 0}))];
+    let e = judge(&refused, false).unwrap_err();
+    assert!(replay_after_failed_resume(&e), "{e}");
+
+    // An api_error marker without a status is a rejection, not a refusal.
+    let rejected = vec![result(json!({"is_error": true, "num_turns": 0,
+        "api_error": "usage_limit_reached", "result": "limit"}))];
+    let e = judge(&rejected, false).unwrap_err();
+    assert_eq!(e, "native request failed: limit");
+    assert!(!replay_after_failed_resume(&e));
+}
+
+#[test]
 fn judge_accepts_answers_and_the_tool_boundary() {
     assert!(judge(&[answer("claude-sonnet-5"), result(json!({}))], true).is_ok());
     // --max-turns 1 ends a tool call with a nonzero exit.
@@ -613,4 +648,34 @@ fn hash_is_stable_across_builds() {
     assert_eq!(hash_of(""), 0xcbf2_9ce4_8422_2325);
     assert_eq!(hash_of("a"), 0xaf63_dc4c_8601_ec8c);
     assert_eq!(hash_of("foobar"), 0x8594_4171_f739_67e8);
+}
+
+#[test]
+fn result_without_iterations_gauges_the_last_request_not_the_sum() {
+    // Two upstream requests in one query and no `iterations` list: the
+    // top level sums both legs (~321k cache reads, which is what made the
+    // gauge jump). The gauge must be the last request's prompt size.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "step"}],
+            "usage": {"input_tokens": 2, "output_tokens": 4,
+                "cache_read_input_tokens": 160000,
+                "cache_creation_input_tokens": 100}}}),
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {"input_tokens": 2, "output_tokens": 4,
+                "cache_read_input_tokens": 161000,
+                "cache_creation_input_tokens": 100}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 4, "output_tokens": 700,
+                "cache_read_input_tokens": 321000,
+                "cache_creation_input_tokens": 200}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (_, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.input_tokens, 2 + 161000 + 100);
+    assert_eq!(usage.cached_tokens, 161000);
+    assert_eq!(usage.cache_write_tokens, 100);
+    // Output is the turn's final count from `result`.
+    assert_eq!(usage.output_tokens, 700);
 }
