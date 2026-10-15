@@ -118,13 +118,8 @@ enum Term {
 enum Route {
     /// The delta doesn't belong to this session; it goes back untouched.
     Diverge,
-    /// Delta applied (or safely deferred, counted by `applied_to`).
-    Applied {
-        applied_to: usize,
-        /// Merged user blocks deferred until the parked front's result —
-        /// a stdin user frame mid-query interrupts and wedges the child.
-        pending_user: Option<Vec<Value>>,
-    },
+    /// Delta applied, counted by `applied_to`.
+    Applied { applied_to: usize },
 }
 
 /// One live `claude` child plus the replay state needed to recognize and
@@ -183,6 +178,10 @@ pub struct LiveSession {
     rewarmed: bool,
     /// Frames written this turn, for the `CLAUDE_SUB_DEBUG` dump.
     sent: Vec<Value>,
+    /// Contents of user frames written while the front query was parked.
+    /// claude's replay of each one says where it landed: inside the
+    /// still-running query (no result of its own) or as a new query.
+    mid_frames: Vec<Value>,
     /// No-activity window before a drain gives up; stream progress
     /// resets it. `deadline` remains the absolute cap.
     idle: Duration,
@@ -589,6 +588,7 @@ fn argv(
         "stream-json".into(),
         "--verbose".into(),
         "--include-partial-messages".into(),
+        "--replay-user-messages".into(),
         // An empty --tools disables builtins AND masks MCP tools; the
         // server-scoped pattern allows every `gray` tool and nothing
         // else, and allowedTools pre-approves them — under dontAsk an
@@ -744,12 +744,12 @@ impl LiveSession {
     /// parked or already-answered call means divergence, and the session
     /// goes back untouched.
     ///
-    /// A user frame must never land while the front query is parked on a
-    /// tool call: mid-query stdin is an interrupt that leaves the parked
-    /// call's query result-less and wedges the child. When the front is
-    /// parked the merged user frame defers — the caller sends it after
-    /// the front's `result` arrives — and `applied_to` then marks only
-    /// the delivered prefix so an unsent frame re-arrives next turn.
+    /// When the front is parked, the user frame is written before the
+    /// answers: claude queues it and attaches it at the tool boundary,
+    /// usually inside the running query (one `result` for both). Its
+    /// `--replay-user-messages` echo settles the owed-result count either
+    /// way, and the whole delta counts as absorbed — so the next turn,
+    /// whose history carries the message, still continues this session.
     fn route_delta(
         &mut self,
         delta: &[Value],
@@ -761,8 +761,7 @@ impl LiveSession {
         let front_parked = !self.bridge.unanswered_ids().is_empty();
         let mut answers: Vec<(String, String)> = Vec::new();
         let mut user_blocks: Vec<Value> = Vec::new();
-        let mut user_at: Option<usize> = None;
-        for (j, item) in delta.iter().enumerate() {
+        for item in delta {
             match chat::item_kind(item) {
                 "function_call_output" => {
                     let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
@@ -787,7 +786,6 @@ impl LiveSession {
                     answers.push((id.to_string(), text));
                 }
                 "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
-                    user_at.get_or_insert(j);
                     let content = item.get("content").cloned().unwrap_or(Value::Null);
                     let text = chat::text_of(&content);
                     if !text.is_empty() {
@@ -800,10 +798,18 @@ impl LiveSession {
                 _ => return Ok(Route::Diverge),
             }
         }
-        // Apply: parked calls answer first so the front query resumes
-        // before the new user frame lands behind it. Any parked call the
-        // host produced no result for gets an error answer — leaving it
-        // parked would block the front (and every queued frame) forever.
+        if undelivered && !user_blocks.is_empty() {
+            user_blocks.insert(0, json!({"type": "text", "text": NOTE_UNDELIVERED}));
+        }
+        // A user message for a parked query goes in BEFORE its answers:
+        // claude queues it and attaches it at the tool boundary, so the
+        // model's very next step sees it as a real user message.
+        if front_parked && !user_blocks.is_empty() {
+            self.mid_frames.push(Value::Array(user_blocks.clone()));
+            self.send_user(std::mem::take(&mut user_blocks))?;
+        }
+        // Any parked call the host produced no result for gets an error
+        // answer — leaving it parked would block the front forever.
         for (id, text) in answers {
             let text = if text.is_empty() {
                 "(no output)".to_string()
@@ -826,29 +832,11 @@ impl LiveSession {
             // The previously parked query owes a result again.
             self.running += 1;
         }
-        if undelivered && !user_blocks.is_empty() {
-            user_blocks.insert(0, json!({"type": "text", "text": NOTE_UNDELIVERED}));
+        if !user_blocks.is_empty() {
+            self.send_user(user_blocks)?;
         }
-        if user_blocks.is_empty() {
-            return Ok(Route::Applied {
-                applied_to: delta_at + delta.len(),
-                pending_user: None,
-            });
-        }
-        if front_parked {
-            // Deferred: the frame goes in after the front's result.
-            // Absorbed state marks only the contiguous applied prefix —
-            // the delta's user items (and anything behind them, which
-            // `answered` absorbs on replay) come back next turn.
-            return Ok(Route::Applied {
-                applied_to: delta_at + user_at.unwrap_or(0),
-                pending_user: Some(user_blocks),
-            });
-        }
-        self.send_user(user_blocks)?;
         Ok(Route::Applied {
             applied_to: delta_at + delta.len(),
-            pending_user: None,
         })
     }
 
@@ -915,6 +903,17 @@ impl LiveSession {
                         if let Some(id) = b.get("id").and_then(Value::as_str) {
                             expected.insert(id.to_string());
                         }
+                    }
+                }
+            }
+            Some("user") if v.get("isReplay").and_then(Value::as_bool) == Some(true) => {
+                let content = v.pointer("/message/content").unwrap_or(&Value::Null);
+                if let Some(k) = self.mid_frames.iter().position(|c| c == content) {
+                    self.mid_frames.remove(k);
+                    if self.running > 1 {
+                        // Consumed before the front's result: merged into
+                        // that query, so it owes no result of its own.
+                        self.running -= 1;
                     }
                 }
             }
@@ -1132,6 +1131,7 @@ impl LiveSession {
             return false;
         }
         self.running = 0;
+        self.mid_frames.clear();
         self.bridge.answer_open_error(NOTE_SUPERSEDED);
         if chat::api_error(e).is_some_and(|(c, _)| c == 429) {
             self.rate_limited = true;
@@ -1388,6 +1388,7 @@ fn spawn_child(
         sid: String::new(),
         pid,
         sent: Vec::new(),
+        mid_frames: Vec::new(),
         rewarmed: false,
         idle: idle_window(),
     })
@@ -1653,7 +1654,7 @@ pub fn run_turn(
     );
     let deadline = Instant::now() + timeout;
     let (claimed, miss_reason) = take(&turn, effort, deadline);
-    let (mut s, mut applied_to, pending_user, mode) = match claimed {
+    let (mut s, applied_to, mode) = match claimed {
         Some((mut s, delta_at, undelivered)) => {
             let names = turn.names.clone();
             s.sent.clear();
@@ -1664,10 +1665,7 @@ pub fn run_turn(
                 return finish_spawn(s2, term, lines, &turn, "fresh:bridge_dead");
             }
             match s.route_delta(&turn.input[delta_at..], undelivered, delta_at) {
-                Ok(Route::Applied {
-                    applied_to,
-                    pending_user,
-                }) => (s, applied_to, pending_user, "reuse".to_string()),
+                Ok(Route::Applied { applied_to }) => (s, applied_to, "reuse".to_string()),
                 Ok(Route::Diverge) => {
                     // The delta doesn't continue this session after all —
                     // give it back untouched and cold-start the request.
@@ -1689,38 +1687,9 @@ pub fn run_turn(
             return finish_spawn(s, term, lines, &turn, &format!("fresh:{miss_reason}"));
         }
     };
-    // Reused session: the delta routed, now drain to the boundary. A
-    // deferred user frame goes in only once the parked front's result
-    // landed — mid-query stdin is an interrupt that wedges the child.
+    // Reused session: the delta routed, now drain to the boundary.
     let lines = match s.drain(deadline, false) {
-        Ok((term, mut lines)) => {
-            match term {
-                Term::Done => {
-                    if let Some(blocks) = pending_user {
-                        if s.send_user(blocks).is_err() {
-                            // Dead wire writing the deferred frame: the
-                            // turn is still answerable on a fresh child.
-                            s.close();
-                            let (s2, t2, l2) = spawn_conversation(&turn, tools, effort, deadline)?;
-                            return finish_spawn(s2, t2, l2, &turn, "fresh:send_dead");
-                        }
-                        applied_to = turn.input.len();
-                        match s.drain(deadline, false) {
-                            Ok((_, lines2)) => lines.extend(lines2),
-                            Err(e) => {
-                                if s.settle(&e) {
-                                    give_back(s);
-                                }
-                                return Err(e);
-                            }
-                        }
-                    }
-                    lines
-                }
-                // Still parked — the deferred user frame rides next turn.
-                Term::Calls => lines,
-            }
-        }
+        Ok((_, lines)) => lines,
         Err(e) => {
             if debug_on() {
                 dump_debug(
@@ -1890,11 +1859,7 @@ mod tests {
         // Whole-turn retry of a failed turn: absorbed == input, the child
         // is idle — the resend is the user delta after the last
         // assistant-side item.
-        let input = vec![
-            user_msg("hi"),
-            assistant_msg("a"),
-            user_msg("do the thing"),
-        ];
+        let input = vec![user_msg("hi"), assistant_msg("a"), user_msg("do the thing")];
         let (delta_at, undelivered) = retry_delta(0, 0, &[], "", &input).unwrap();
         assert_eq!(delta_at, 2, "the last user frame re-asks");
         assert!(!undelivered);
@@ -1905,7 +1870,10 @@ mod tests {
         let input = vec![user_msg("hi"), assistant_msg("a"), user_msg("go")];
         let (_, undelivered) =
             retry_delta(0, 0, &["c1".to_string()], "answer text", &input).unwrap();
-        assert!(undelivered, "a recorded reply the host never echoed is lost");
+        assert!(
+            undelivered,
+            "a recorded reply the host never echoed is lost"
+        );
     }
 
     #[test]
@@ -1936,5 +1904,4 @@ mod tests {
         let input = vec![user_msg("hi"), assistant_msg("a")];
         assert_eq!(retry_delta(0, 0, &[], "", &input), Err("stale"));
     }
-
 }
