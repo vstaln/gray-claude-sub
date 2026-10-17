@@ -49,26 +49,55 @@ struct Response {
 /// the relay server fills the transcript in when the host POSTs.
 type Relays = relay::Intents;
 
+fn cli_help() -> String {
+    "claude-sub — Claude Pro/Max subscription provider for gray\n\
+     usage: claude-sub manifest | sidecar | tools [all|bash|+name|-name|name …]\n\
+     slash:  /claude · /claude tools …"
+        .to_string()
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     // `gray install plugin` registers sidecars by running `<bin> manifest`.
-    if std::env::args().nth(1).as_deref() == Some("manifest") {
-        println!("{}", serde_json::to_string(&manifest::manifest())?);
-        return Ok(());
-    }
-    // `claude` spawns `claude-sub mcp <endpoint>` to reach the `gray` MCP
-    // server a live session bound ([`mcp::bridge_main`]): a plain pipe
-    // between its stdio and the session transport.
-    if std::env::args().nth(1).as_deref() == Some("mcp") {
-        let endpoint = std::env::args().nth(2).unwrap_or_default();
-        std::process::exit(mcp::bridge_main(&endpoint));
-    }
-    // `gray claude-sub tools …` and the REPL's `/claude tools …` land on
-    // the same file: one allowlist, no sidecar needed.
-    if std::env::args().nth(1).as_deref() == Some("tools") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        println!("{}", claude_sub::settings::tools_command(&args));
-        return Ok(());
+    match std::env::args_os().nth(1).as_deref() {
+        Some(m) if m == "manifest" => {
+            println!("{}", serde_json::to_string(&manifest::manifest())?);
+            return Ok(());
+        }
+        // `claude` spawns `claude-sub mcp <endpoint>` to reach the `gray` MCP
+        // server a live session bound ([`mcp::bridge_main`]): a plain pipe
+        // between its stdio and the session transport.
+        Some(m) if m == "mcp" => {
+            let Some(endpoint) = std::env::args_os().nth(2) else {
+                eprintln!("mcp needs an endpoint\n\n{}", cli_help());
+                std::process::exit(2);
+            };
+            std::process::exit(mcp::bridge_main(&endpoint.to_string_lossy()));
+        }
+        // `gray claude-sub tools …` and the REPL's `/claude tools …` land on
+        // the same file: one allowlist, no sidecar needed.
+        Some(t) if t == "tools" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            println!("{}", claude_sub::settings::tools_command(&args));
+            return Ok(());
+        }
+        Some(s) if s == "help" || s == "--help" || s == "-h" => {
+            println!("{}", cli_help());
+            return Ok(());
+        }
+        Some(s) if s == "sidecar" => {}
+        Some(other) => {
+            eprintln!("unknown verb {other:?}\n\n{}", cli_help());
+            std::process::exit(2);
+        }
+        None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            println!("{}", cli_help());
+            return Ok(());
+        }
+        None => {}
     }
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     // Re-warm live sessions before their ~1h prompt-cache entry lapses.
