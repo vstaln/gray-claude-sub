@@ -196,14 +196,16 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
         )),
         "provider/auth/cancel" => Ok(json!({})),
         "provider/auth/refresh" => {
-            let req: ProviderRefreshRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider refresh request"))?;
+            let req: ProviderRefreshRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/refresh params: {e}"))
+            })?;
             ensure_provider(&req.provider, &req.auth_method)?;
             Ok(json!({"status": "unsupported"}))
         }
         "provider/auth/revoke" => {
-            let req: ProviderRevokeRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider revoke request"))?;
+            let req: ProviderRevokeRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/revoke params: {e}"))
+            })?;
             ensure_provider(&req.provider, &req.auth_method)?;
             Ok(json!({"status": "unsupported"}))
         }
@@ -253,10 +255,12 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                 })
                 .unwrap_or_default();
             manifest::run_command(name, &argv)
-                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".into()))
+                .ok_or_else(|| ProviderRpcError::Protocol(format!("unknown command: {name}")))
         }
         "plugin/shutdown" => Ok(json!({})),
-        _ => Err(ProviderRpcError::Protocol("unknown provider method".into())),
+        other => Err(ProviderRpcError::Protocol(format!(
+            "method not found: {other}"
+        ))),
     }
 }
 
@@ -354,10 +358,6 @@ fn ensure_provider(provider: &str, auth_method: &str) -> Result<(), ProviderRpcE
             "unknown provider or auth method".into(),
         ))
     }
-}
-
-fn invalid(message: &'static str) -> ProviderRpcError {
-    ProviderRpcError::Protocol(message.into())
 }
 
 fn error_value(error: ProviderRpcError) -> Value {
