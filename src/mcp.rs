@@ -363,6 +363,7 @@ impl Bridge {
     /// Mark the transport dead and wake every waiter so parked calls
     /// resolve instead of hanging their threads.
     fn flag_dead(&self) {
+        dlog("flag_dead");
         self.shared.dead.store(true, Ordering::Relaxed);
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.closed = true;
@@ -417,13 +418,28 @@ fn accept_loop(listener: Listener, shared: Arc<Shared>, arrivals: Sender<String>
             return;
         }
         match accept(&listener) {
-            Ok(conn) => serve_conn(conn, &shared, &arrivals),
+            Ok(conn) => {
+                dlog("conn accepted");
+                // A thread per conn: the client overlaps a probe conn
+                // (server/discover) with the real session conn — serving
+                // strictly one-at-a-time starves whichever lands second.
+                let shared2 = shared.clone();
+                let arrivals2 = arrivals.clone();
+                std::thread::spawn(move || serve_conn(conn, &shared2, &arrivals2));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(60));
             }
             // A stray loopback connection failed the token handshake.
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
-            Err(_) => return,
+            // Any other per-conn error — notably ConnectionAborted/Reset,
+            // which Windows reports when a client (e.g. a probe child the
+            // caller just killed) RSTs between SYN and accept — must not
+            // kill the listener: the real transport child is still coming.
+            Err(e) => {
+                dlog(&format!("accept err {e}"));
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -431,15 +447,35 @@ fn accept_loop(listener: Listener, shared: Arc<Shared>, arrivals: Sender<String>
 /// Read JSON-RPC lines off the accepted connection. Requests are answered
 /// inline (initialize/tools/list/unknown) or parked (`tools/call`);
 /// notifications and stray responses are dropped.
+///
+/// Claude Code ≥2.1 opens `server/discover` on a probe connection it then
+/// drops and reopens for the real session — a probe-only EOF is not a dead
+/// bridge: leave `dead`/`closed` untouched so `accept_loop` takes the
+/// reconnect. Only a conn that carried real traffic latches the bridge
+/// dead on EOF.
 fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
-    let Ok(writer) = conn.try_clone() else {
-        shared.dead.store(true, Ordering::Relaxed);
+    let Ok(mut writer) = conn.try_clone() else {
+        // A conn we can't echo on can't serve — but it's no proof the
+        // session conn is gone, so the bridge stays unflagged.
         return;
     };
-    *shared.write.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
     let reader = BufReader::new(conn);
+    // Inline replies ride THIS conn — a probe conn must never receive a
+    // response meant for the session conn, and vice versa.
+    let mut session = false;
+    let mut why = "peer eof";
     for line in reader.lines() {
-        let Ok(line) = line else { break };
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                why = if e.kind() == std::io::ErrorKind::ConnectionReset {
+                    "peer rst"
+                } else {
+                    "read err"
+                };
+                break;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -448,21 +484,59 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
             continue;
         };
         trace("mcp<", &v);
+        dlog(&format!(
+            "recv method={:?} id={:?}",
+            v.get("method").and_then(Value::as_str),
+            v.get("id")
+        ));
         let is_request = v.get("method").is_some() && v.get("id").is_some();
         if !is_request {
             // Notifications and stray responses carry nothing we need.
             continue;
         }
         let id = v.get("id").cloned().unwrap_or(Value::Null);
-        match v.get("method").and_then(Value::as_str) {
+        let method = v.get("method").and_then(Value::as_str);
+        if method != Some("server/discover") && !session {
+            // First real request: this conn becomes the session conn —
+            // notifications and parked-call answers ride its write half.
+            session = true;
+            if let Ok(w) = writer.try_clone() {
+                *shared.write.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+            }
+        }
+        let answered = match method {
+            // Claude Code ≥2.1 probes `server/discover` (MCP 2026-07-28)
+            // before `initialize`. The client picks the newest version
+            // both sides support: advertising 2026-07-28 puts it on the
+            // modern path (subscriptions/listen + tools/list, no
+            // `initialize` ever arrives); legacy-only versions strand it
+            // re-probing forever — it no longer falls back.
+            Some("server/discover") => reply(
+                &mut writer,
+                &json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28", "2025-11-25",
+                        "2025-06-18", "2025-03-26", "2024-11-05"],
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "_meta": {"io.modelcontextprotocol/serverInfo":
+                        {"name": "gray", "version": "1"}},
+                }}),
+            ),
+            // Modern-era change subscription the client opens right after
+            // discovery. Accept it silently — we still push
+            // tools/list_changed through the normal notification path.
+            Some("subscriptions/listen") => reply(
+                &mut writer,
+                &json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            ),
             Some("initialize") => {
                 // Echo the client's protocol version verbatim.
                 let pv = v
                     .pointer("/params/protocolVersion")
                     .cloned()
                     .unwrap_or(json!("2024-11-05"));
-                write_or_die(
-                    shared,
+                reply(
+                    &mut writer,
                     // `listChanged` is what makes the client honor the
                     // tools/list_changed notification — without it the
                     // first (often empty) inventory is cached for good.
@@ -471,21 +545,22 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
                         "capabilities": {"tools": {"listChanged": true}},
                         "serverInfo": {"name": "gray", "version": "1"},
                     }}),
-                );
+                )
             }
-            Some("ping") => {
-                write_or_die(shared, &json!({"jsonrpc": "2.0", "id": id, "result": {}}));
-            }
+            Some("ping") => reply(
+                &mut writer,
+                &json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            ),
             Some("tools/list") => {
                 let tools = shared
                     .state
                     .lock()
                     .map(|st| st.tools.clone())
                     .unwrap_or_default();
-                write_or_die(
-                    shared,
+                reply(
+                    &mut writer,
                     &json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}}),
-                );
+                )
             }
             Some("tools/call") => {
                 // The toolUseId ties this request to the assistant event's
@@ -497,11 +572,14 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
                     .unwrap_or("")
                     .to_string();
                 if tool_use_id.is_empty() {
-                    write_or_die(
-                        shared,
+                    if !reply(
+                        &mut writer,
                         &json!({"jsonrpc": "2.0", "id": id, "error":
                             {"code": -32602, "message": "tools/call without claudecode/toolUseId"}}),
-                    );
+                    ) {
+                        why = "write fail";
+                        break;
+                    }
                     continue;
                 }
                 {
@@ -513,25 +591,34 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
                 // call's response rides its own waiter thread.
                 let shared2 = shared.clone();
                 std::thread::spawn(move || answer_waiter(shared2, tool_use_id));
+                true
             }
-            _ => {
-                write_or_die(
-                    shared,
-                    &json!({"jsonrpc": "2.0", "id": id, "error":
-                        {"code": -32601, "message": "method not found"}}),
-                );
-            }
+            _ => reply(
+                &mut writer,
+                &json!({"jsonrpc": "2.0", "id": id, "error":
+                    {"code": -32601, "message": "method not found"}}),
+            ),
+        };
+        if !answered {
+            why = "write fail";
+            break;
         }
         if shared.state.lock().map(|st| st.closed).unwrap_or(true) {
+            why = "closed flag";
             break;
         }
     }
-    // The bridge child went away: no more calls can arrive.
-    shared.dead.store(true, Ordering::Relaxed);
-    if let Ok(mut st) = shared.state.lock() {
-        st.closed = true;
+    dlog(&format!("conn end ({why}) session={session}"));
+    if session {
+        // A session connection went away: no more calls can arrive on it,
+        // and a reconnect still counts as a new probe until it speaks.
+        *shared.write.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        shared.dead.store(true, Ordering::Relaxed);
+        if let Ok(mut st) = shared.state.lock() {
+            st.closed = true;
+        }
+        shared.answered.notify_all();
     }
-    shared.answered.notify_all();
 }
 
 /// CLAUDE_SUB_DEBUG wire trace for the bridge side (stderr, no secrets —
@@ -540,6 +627,28 @@ fn trace(tag: &str, v: &Value) {
     if std::env::var_os("CLAUDE_SUB_DEBUG").is_some() {
         eprintln!("{tag} {}", serde_json::to_string(v).unwrap_or_default());
     }
+}
+
+/// Milliseconds since process start — cheap clock for the conn log.
+fn t_ms() -> u128 {
+    use std::sync::OnceLock;
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+}
+
+fn dlog(msg: &str) {
+    if std::env::var_os("CLAUDE_SUB_DEBUG").is_some() {
+        eprintln!("mcp= {:>6}ms {msg}", t_ms());
+    }
+}
+
+/// Write an inline response on the conn that asked. `false` on a dead
+/// socket — the caller's read loop then ends and EOF decides the verdict.
+fn reply(writer: &mut Stream, v: &Value) -> bool {
+    trace("mcp>", v);
+    write_line(writer, v).is_ok()
 }
 
 /// Write an inline response; a dead socket flips the bridge dead so the
@@ -613,9 +722,23 @@ pub fn sock_path() -> PathBuf {
 /// the inherited stdio (what claude speaks MCP on) and the session
 /// transport. Either side closing ends the bridge.
 pub fn bridge_main(endpoint: &str) -> i32 {
+    let mark = |m: &str| {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("bridge_main.log"))
+        {
+            use std::io::Write as _;
+            let _ = writeln!(f, "pid={} {m} endpoint={endpoint}", std::process::id());
+        }
+    };
+    mark("spawned");
     let conn = match connect(endpoint) {
         Ok(c) => c,
-        Err(_) => return 1,
+        Err(e) => {
+            mark(&format!("connect failed: {e}"));
+            return 1;
+        }
     };
     let Ok(mut to_sock) = conn.try_clone() else {
         return 1;
@@ -623,16 +746,28 @@ pub fn bridge_main(endpoint: &str) -> i32 {
     let stdin = std::io::stdin();
     let pump = std::thread::spawn(move || {
         let reader = BufReader::new(stdin);
+        let mut why = "stdin eof";
         for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if to_sock
-                .write_all(line.as_bytes())
-                .and_then(|()| to_sock.write_all(b"\n"))
-                .and_then(|()| to_sock.flush())
-                .is_err()
-            {
-                break;
+            match line {
+                Ok(line) => {
+                    if to_sock
+                        .write_all(line.as_bytes())
+                        .and_then(|()| to_sock.write_all(b"\n"))
+                        .and_then(|()| to_sock.flush())
+                        .is_err()
+                    {
+                        why = "sock write err";
+                        break;
+                    }
+                }
+                Err(_) => {
+                    why = "stdin err";
+                    break;
+                }
             }
+        }
+        if std::env::var_os("CLAUDE_SUB_DEBUG").is_some() {
+            eprintln!("mcp-child: stdin pump ended ({why})");
         }
         // stdin gone means claude is done with us.
         to_sock.shutdown();
@@ -640,16 +775,28 @@ pub fn bridge_main(endpoint: &str) -> i32 {
     {
         let reader = BufReader::new(conn);
         let mut stdout = std::io::stdout();
+        let mut why = "conn eof";
         for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if stdout
-                .write_all(line.as_bytes())
-                .and_then(|()| stdout.write_all(b"\n"))
-                .and_then(|()| stdout.flush())
-                .is_err()
-            {
-                break;
+            match line {
+                Ok(line) => {
+                    if stdout
+                        .write_all(line.as_bytes())
+                        .and_then(|()| stdout.write_all(b"\n"))
+                        .and_then(|()| stdout.flush())
+                        .is_err()
+                    {
+                        why = "stdout write err";
+                        break;
+                    }
+                }
+                Err(_) => {
+                    why = "conn read err";
+                    break;
+                }
             }
+        }
+        if std::env::var_os("CLAUDE_SUB_DEBUG").is_some() {
+            eprintln!("mcp-child: sock pump ended ({why})");
         }
     }
     // Either pump ending is enough: don't linger on the other half.

@@ -627,12 +627,10 @@ fn argv(
         "--permission-mode".into(),
         "dontAsk".into(),
         "--mcp-config".into(),
-        json!({"mcpServers": {"gray": {
-            "type": "stdio",
-            "command": exe,
-            "args": ["mcp", endpoint],
-        }}})
-        .to_string(),
+        // Claude Code ≥2.1.303 treats --mcp-config values strictly as
+        // file paths (inline JSON resolves as a missing file). Stage the
+        // server stanza in cache_root and pass the path.
+        mcp_config_file(std::path::Path::new(&exe), endpoint)?,
     ];
     if let Some((sid, uuid)) = resume {
         argv.extend([
@@ -647,6 +645,35 @@ fn argv(
         argv.push(e.to_string());
     }
     Ok(argv)
+}
+
+/// Stage this session's `gray` stdio-server stanza as a JSON file under
+/// the cache root and return its path for `--mcp-config`. Claude Code
+/// ≥2.1.303 no longer accepts inline JSON there: the value resolves as a
+/// file path and a nonexistent one is fatal at startup. Files are
+/// unique per spawn and small enough to leave for the cache sweep.
+fn mcp_config_file(exe: &std::path::Path, endpoint: &str) -> Result<String, String> {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let command =
+        std::env::var("CLAUDE_SUB_MCP_WRAP").unwrap_or_else(|_| exe.to_string_lossy().into_owned());
+    let body = json!({"mcpServers": {"gray": {
+        "type": "stdio",
+        "command": command,
+        "args": ["mcp", endpoint],
+    }}})
+    .to_string();
+    let path = crate::session::cache_root().join(format!(
+        "mcp-config-{}-{}.json",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("mcp config dir {}: {e}", dir.display()))?;
+    }
+    std::fs::write(&path, body).map_err(|e| format!("mcp config {}: {e}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Host tool inventory in MCP schema — BARE names (claude adds the
@@ -937,6 +964,10 @@ impl LiveSession {
                 if v.get("subtype").and_then(Value::as_str) == Some("init")
                     && !self.tools.is_empty()
                 {
+                    // Claude Code ≥2.1.303 reports `pending` while the
+                    // discover probe is still in flight — the mount
+                    // resolves asynchronously and the session conn arrives
+                    // later. Only a definitive failure verdict is fatal.
                     let failed = v
                         .get("mcp_servers")
                         .and_then(Value::as_array)
@@ -944,10 +975,20 @@ impl LiveSession {
                         .flatten()
                         .any(|s| {
                             s.get("name").and_then(Value::as_str) == Some("gray")
-                                && s.get("status").and_then(Value::as_str) != Some("connected")
+                                && !matches!(
+                                    s.get("status").and_then(Value::as_str),
+                                    Some("connected") | Some("pending")
+                                )
                         });
                     if failed {
-                        return Err(MCP_MOUNT_FAILED.to_string());
+                        let detail = v
+                            .get("mcp_servers")
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "{MCP_MOUNT_FAILED} · servers={detail} · native stderr: {}",
+                            self.stderr_tail()
+                        ));
                     }
                 }
             }

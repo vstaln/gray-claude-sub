@@ -107,20 +107,127 @@ fn env_override() -> Option<String> {
 }
 
 /// Resolve the `claude` binary: explicit override, then PATH.
+///
+/// On Windows the PATH entries are shim files, not spawn targets: the bare
+/// `claude` is a POSIX script (`CreateProcess` → os error 193), and
+/// `claude.cmd` routes through `cmd.exe`, which cannot carry arguments
+/// containing newlines (Rust refuses them, `os error 1231`-class
+/// InvalidInput). The npm `.cmd` shim ends by exec'ing the real PE
+/// (`node_modules\@anthropic-ai\claude-code\bin\claude.exe`), so we resolve
+/// through the shim to the `.exe` it wraps. A `.cmd` we cannot unwrap is
+/// still returned as a last resort — simple probes like `auth status`
+/// carry no newlines and survive cmd.exe.
 pub fn resolve_command() -> Option<String> {
     if let Some(v) = env_override() {
         return Some(v);
     }
     let path = std::env::var_os("PATH")?;
+    let names: &[&str] = if cfg!(windows) {
+        &["claude.exe", "claude.cmd", "claude"]
+    } else {
+        &["claude", "claude.exe", "claude.cmd"]
+    };
+    let mut cmd_fallback: Option<PathBuf> = None;
     for dir in std::env::split_paths(&path) {
-        for name in ["claude", "claude.exe", "claude.cmd"] {
+        for name in names {
             let p: PathBuf = dir.join(name);
-            if p.is_file() {
-                return Some(p.to_string_lossy().into_owned());
+            if !p.is_file() {
+                continue;
             }
+            #[cfg(windows)]
+            {
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+                    if let Some(real) = unwrap_cmd_shim(&p) {
+                        return Some(real.to_string_lossy().into_owned());
+                    }
+                    cmd_fallback.get_or_insert(p);
+                    continue;
+                }
+                if !lower.ends_with(".exe") && !is_pe_binary(&p) {
+                    continue; // POSIX shim — unspawnable on Windows
+                }
+            }
+            return Some(p.to_string_lossy().into_owned());
         }
     }
-    None
+    cmd_fallback.map(|p| p.to_string_lossy().into_owned())
+}
+
+/// First bytes are `MZ`: the file is a PE executable and `CreateProcess`
+/// will run it regardless of its (missing) extension.
+#[cfg(windows)]
+fn is_pe_binary(p: &PathBuf) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 2];
+    std::fs::File::open(p)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok_and(|_| magic == *b"MZ")
+}
+
+/// Resolve the executable an npm-style `.cmd`/`.bat` shim execs. Such
+/// shims end in `"<path>"  %*` where `<path>` may embed `%~dp0`/`%dp0%`
+/// (the shim's own directory) or `%ENV%`. Returns the last quoted token
+/// that resolves to a real file.
+#[cfg(windows)]
+fn unwrap_cmd_shim(shim: &PathBuf) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(shim).ok()?;
+    let dir = shim.parent()?.to_path_buf();
+    let mut found = None;
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find('"') {
+        let tail = &rest[start + 1..];
+        let Some(end) = tail.find('"') else { break };
+        let token = &tail[..end];
+        rest = &tail[end + 1..];
+        if !(token.contains('\\') || token.contains('/')) {
+            continue;
+        }
+        // %~dp0/%dp0% expand to the shim's own directory (trailing slash
+        // included) — substitute before generic %VAR% expansion so `dp0`
+        // is never looked up in env.
+        let dir_str = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
+        let mut expanded = token
+            .replace("%~dp0", &dir_str)
+            .replace("%dp0%", &dir_str)
+            .replace("%~dps0", &dir_str);
+        let mut out = String::with_capacity(expanded.len());
+        while let Some(off) = expanded.find('%') {
+            out.push_str(&expanded[..off]);
+            let tail2 = &expanded[off + 1..];
+            match tail2.find('%') {
+                Some(e) => {
+                    let var = &tail2[..e];
+                    if let Ok(v) = std::env::var(var) {
+                        out.push_str(&v);
+                    } else {
+                        out.push('%');
+                        out.push_str(var);
+                        out.push('%');
+                    }
+                    expanded = tail2[e + 1..].to_string();
+                }
+                None => {
+                    out.push_str(&expanded);
+                    expanded.clear();
+                }
+            }
+        }
+        out.push_str(&expanded);
+        let candidate = PathBuf::from(&out);
+        let candidate = if candidate.is_absolute() || out.starts_with("\\\\") {
+            candidate
+        } else {
+            // Root-relative remainder like `\node_modules\…` (a prefix-less
+            // `\` path would survive join() only as drive-rooted) — strip
+            // one leading separator so it lands under the shim directory.
+            dir.join(PathBuf::from(out.trim_start_matches(['\\', '/'])))
+        };
+        if candidate.is_file() {
+            found = Some(candidate);
+        }
+    }
+    found
 }
 
 /// Fail-closed auth env: a set value would forward the subscription bearer
