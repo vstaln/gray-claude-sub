@@ -56,12 +56,12 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&manifest::manifest())?);
         return Ok(());
     }
-    // `claude` spawns `claude-sub mcp <sock>` to reach the `gray` MCP
+    // `claude` spawns `claude-sub mcp <endpoint>` to reach the `gray` MCP
     // server a live session bound ([`mcp::bridge_main`]): a plain pipe
-    // between its stdio and the unix socket.
+    // between its stdio and the session transport.
     if std::env::args().nth(1).as_deref() == Some("mcp") {
-        let sock = std::env::args().nth(2).unwrap_or_default();
-        std::process::exit(mcp::bridge_main(&sock));
+        let endpoint = std::env::args().nth(2).unwrap_or_default();
+        std::process::exit(mcp::bridge_main(&endpoint));
     }
     // `gray claude-sub tools …` and the REPL's `/claude tools …` land on
     // the same file: one allowlist, no sidecar needed.

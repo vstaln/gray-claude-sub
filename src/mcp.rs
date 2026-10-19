@@ -24,15 +24,193 @@
 //!   host inventory changes mid-session.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// The bridge stream: a unix socket on unix, a loopback TCP stream on
+/// Windows (no unix sockets there). `Tcp` exists everywhere so the
+/// Windows transport can be exercised on unix with
+/// `CLAUDE_SUB_MCP_TRANSPORT=tcp`.
+enum Stream {
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    Tcp(std::net::TcpStream),
+}
+
+impl Stream {
+    fn try_clone(&self) -> std::io::Result<Stream> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.try_clone().map(Stream::Unix),
+            Stream::Tcp(s) => s.try_clone().map(Stream::Tcp),
+        }
+    }
+
+    /// End the stream both ways so the peer's read loop hits EOF.
+    fn shutdown(&self) {
+        let _ = match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.shutdown(std::net::Shutdown::Both),
+            Stream::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
+        };
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.read(buf),
+            Stream::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.write(buf),
+            Stream::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Stream::Unix(s) => s.flush(),
+            Stream::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+/// The bound side of the transport. Nonblocking so the accept loop can
+/// poll `dead` — a listener has no shutdown we could signal instead.
+enum Listener {
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixListener),
+    Tcp {
+        inner: std::net::TcpListener,
+        /// First line a client must send: a unix socket hides behind
+        /// mode-0700 directories, an open port does not — the token keeps
+        /// stray loopback connections from parking `tools/call`s.
+        token: String,
+    },
+}
+
+/// True on Windows (no unix sockets) or when the TCP transport is forced
+/// for development.
+fn use_tcp() -> bool {
+    cfg!(windows)
+        || std::env::var_os("CLAUDE_SUB_MCP_TRANSPORT").is_some_and(|v| v == "tcp")
+}
+
+/// A per-session shared secret for the TCP transport: RandomState's keys
+/// are OS-seeded, so hashing time+pid under fresh states is unguessable
+/// enough for a loopback handshake.
+fn auth_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut a = RandomState::new().build_hasher();
+    a.write_u128(nanos);
+    a.write_u32(std::process::id());
+    let mut b = RandomState::new().build_hasher();
+    b.write_u64(a.finish());
+    format!("{:016x}{:016x}", a.finish(), b.finish())
+}
+
+/// Bind the transport; returns the listener, the endpoint string
+/// `claude-sub mcp <endpoint>` connects to, and the file to unlink on
+/// close (the socket path on unix, none on TCP).
+fn listen() -> std::io::Result<(Listener, String, Option<PathBuf>)> {
+    if use_tcp() {
+        let inner = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        inner.set_nonblocking(true)?;
+        let port = inner.local_addr()?.port();
+        let token = auth_token();
+        let listener = Listener::Tcp {
+            inner,
+            token: token.clone(),
+        };
+        return Ok((listener, format!("tcp:{port}:{token}"), None));
+    }
+    #[cfg(unix)]
+    {
+        let path = sock_path();
+        if let Some(dir) = path.parent() {
+            let mut mkdir = std::fs::DirBuilder::new();
+            mkdir.recursive(true);
+            use std::os::unix::fs::DirBuilderExt;
+            mkdir.mode(0o700);
+            mkdir.create(dir)?;
+        }
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        let endpoint = path.to_string_lossy().into_owned();
+        Ok((Listener::Unix(listener), endpoint, Some(path)))
+    }
+    #[cfg(not(unix))]
+    unreachable!("tcp transport is mandatory without unix sockets")
+}
+
+/// Accept one connection. On TCP the client's first line must be the
+/// listener token; anything else fails `PermissionDenied` and the accept
+/// loop keeps going instead of dying on a stray probe.
+fn accept(listener: &Listener) -> std::io::Result<Stream> {
+    match listener {
+        #[cfg(unix)]
+        Listener::Unix(l) => Ok(Stream::Unix(l.accept()?.0)),
+        Listener::Tcp { inner, token } => {
+            let (mut s, _) = inner.accept()?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut want = token.clone();
+            want.push('\n');
+            let mut got = vec![0u8; want.len()];
+            let ok = s.read_exact(&mut got).is_ok() && got == want.as_bytes();
+            let _ = s.set_read_timeout(None);
+            if !ok {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "bridge client failed the token handshake",
+                ));
+            }
+            Ok(Stream::Tcp(s))
+        }
+    }
+}
+
+/// Client side of the transport (`claude-sub mcp <endpoint>`): a unix
+/// socket path, or `tcp:PORT:TOKEN` — connect, then send the token line
+/// before the stdio pump starts.
+fn connect(endpoint: &str) -> std::io::Result<Stream> {
+    if let Some(rest) = endpoint.strip_prefix("tcp:") {
+        let bad = || {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad tcp endpoint")
+        };
+        let (port, token) = rest.split_once(':').ok_or_else(bad)?;
+        let port: u16 = port.parse().map_err(|_| bad())?;
+        let mut s = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))?;
+        s.write_all(token.as_bytes())?;
+        s.write_all(b"\n")?;
+        return Ok(Stream::Tcp(s));
+    }
+    #[cfg(unix)]
+    return std::os::unix::net::UnixStream::connect(endpoint).map(Stream::Unix);
+    #[cfg(not(unix))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "unknown bridge endpoint",
+    ))
+}
 
 /// A `tools/call` request parked upstream maps toolUseId → the JSON-RPC
 /// request id the bridge child sent; the name/arguments already rode the
@@ -57,7 +235,7 @@ struct Shared {
     state: Mutex<State>,
     answered: Condvar,
     /// The accepted connection's write half (a `try_clone` of the reader).
-    write: Mutex<Option<UnixStream>>,
+    write: Mutex<Option<Stream>>,
     /// The socket transport is gone — a dead bridge means tool calls can
     /// never arrive, so the session itself is untrusted.
     dead: AtomicBool,
@@ -66,30 +244,18 @@ struct Shared {
 /// One session's `gray` MCP endpoint: the listener, the (single) accepted
 /// connection and the parked-call table.
 pub struct Bridge {
-    sock_path: PathBuf,
+    endpoint: String,
+    cleanup: Option<PathBuf>,
     shared: Arc<Shared>,
     accept: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Bridge {
-    /// Bind `sock_path` and start the accept/dispatch thread. `arrivals`
-    /// receives the toolUseId of every registered `tools/call` so the turn
-    /// driver can multiplex them against stdout events.
-    pub fn bind(sock_path: PathBuf, arrivals: Sender<String>) -> std::io::Result<Bridge> {
-        if let Some(dir) = sock_path.parent() {
-            let mut mkdir = std::fs::DirBuilder::new();
-            mkdir.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                mkdir.mode(0o700);
-            }
-            mkdir.create(dir)?;
-        }
-        let listener = UnixListener::bind(&sock_path)?;
-        // Nonblocking accept: the close path can't wake a blocking accept
-        // (a unix listener has no shutdown), so poll it and check `dead`.
-        listener.set_nonblocking(true)?;
+    /// Bind the session transport and start the accept/dispatch thread.
+    /// `arrivals` receives the toolUseId of every registered `tools/call`
+    /// so the turn driver can multiplex them against stdout events.
+    pub fn bind(arrivals: Sender<String>) -> std::io::Result<Bridge> {
+        let (listener, endpoint, cleanup) = listen()?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             answered: Condvar::new(),
@@ -99,10 +265,17 @@ impl Bridge {
         let accept_shared = shared.clone();
         let accept = std::thread::spawn(move || accept_loop(listener, accept_shared, arrivals));
         Ok(Bridge {
-            sock_path,
+            endpoint,
+            cleanup,
             shared,
             accept: Some(accept),
         })
+    }
+
+    /// The endpoint `claude-sub mcp <endpoint>` connects to: a unix
+    /// socket path, or `tcp:PORT:TOKEN` on the TCP transport.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Replace the served inventory; notify the client when it changed and
@@ -211,14 +384,16 @@ impl Bridge {
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            let _ = conn.shutdown(std::net::Shutdown::Both);
+            conn.shutdown();
         }
         if let Some(t) = self.accept.take() {
             // The accept loop either polls on `closed` (≤60ms) or sits in
             // the connection read loop, which the shutdown just ended.
             let _ = t.join();
         }
-        let _ = std::fs::remove_file(&self.sock_path);
+        if let Some(path) = self.cleanup.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -237,18 +412,20 @@ fn write_line(w: &mut impl Write, v: &Value) -> std::io::Result<()> {
 
 /// Accept the (single) bridge-child connection and dispatch its requests
 /// until EOF or close.
-fn accept_loop(listener: UnixListener, shared: Arc<Shared>, arrivals: Sender<String>) {
+fn accept_loop(listener: Listener, shared: Arc<Shared>, arrivals: Sender<String>) {
     loop {
         if shared.dead.load(Ordering::Relaxed)
             || shared.state.lock().map(|st| st.closed).unwrap_or(true)
         {
             return;
         }
-        match listener.accept() {
-            Ok((conn, _)) => serve_conn(conn, &shared, &arrivals),
+        match accept(&listener) {
+            Ok(conn) => serve_conn(conn, &shared, &arrivals),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(60));
             }
+            // A stray loopback connection failed the token handshake.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
             Err(_) => return,
         }
     }
@@ -257,7 +434,7 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, arrivals: Sender<Str
 /// Read JSON-RPC lines off the accepted connection. Requests are answered
 /// inline (initialize/tools/list/unknown) or parked (`tools/call`);
 /// notifications and stray responses are dropped.
-fn serve_conn(conn: UnixStream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
+fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
     let Ok(writer) = conn.try_clone() else {
         shared.dead.store(true, Ordering::Relaxed);
         return;
@@ -425,7 +602,8 @@ fn answer_waiter(shared: Arc<Shared>, tool_use_id: String) {
     }
 }
 
-/// A fresh socket path under the sidecar cache root.
+/// A fresh unix socket path under the sidecar cache root.
+#[cfg(unix)]
 pub fn sock_path() -> PathBuf {
     let tag = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -434,11 +612,11 @@ pub fn sock_path() -> PathBuf {
     crate::session::cache_root().join(format!("mcp-{}-{tag:x}.sock", std::process::id()))
 }
 
-/// The `claude-sub mcp <sock>` subcommand: a two-thread pipe between the
-/// inherited stdio (what claude speaks MCP on) and the session socket.
-/// Either side closing ends the bridge.
-pub fn bridge_main(sock: &str) -> i32 {
-    let conn = match UnixStream::connect(Path::new(sock)) {
+/// The `claude-sub mcp <endpoint>` subcommand: a two-thread pipe between
+/// the inherited stdio (what claude speaks MCP on) and the session
+/// transport. Either side closing ends the bridge.
+pub fn bridge_main(endpoint: &str) -> i32 {
+    let conn = match connect(endpoint) {
         Ok(c) => c,
         Err(_) => return 1,
     };
@@ -460,7 +638,7 @@ pub fn bridge_main(sock: &str) -> i32 {
             }
         }
         // stdin gone means claude is done with us.
-        let _ = to_sock.shutdown(std::net::Shutdown::Both);
+        to_sock.shutdown();
     });
     {
         let reader = BufReader::new(conn);

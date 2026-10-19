@@ -45,7 +45,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Value, json};
 
 use crate::chat::{self, PreparedTurn};
-use crate::mcp::{self, Bridge};
+use crate::mcp::Bridge;
 use crate::session::{self, ResumePoint};
 use crate::setup;
 
@@ -575,7 +575,7 @@ fn argv(
     turn: &PreparedTurn,
     system: &str,
     effort: Option<&str>,
-    sock: &std::path::Path,
+    endpoint: &str,
     resume: Option<&ResumePoint>,
 ) -> Result<Vec<String>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
@@ -609,7 +609,7 @@ fn argv(
         json!({"mcpServers": {"gray": {
             "type": "stdio",
             "command": exe.to_string_lossy(),
-            "args": ["mcp", sock.to_string_lossy()],
+            "args": ["mcp", endpoint],
         }}})
         .to_string(),
     ];
@@ -1255,11 +1255,10 @@ fn spawn_live(
     tail: &[Value],
     deadline: Instant,
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
-    let sock = mcp::sock_path();
     let (parked_tx, parked_rx) = channel();
-    let bridge = Bridge::bind(sock.clone(), parked_tx)
-        .map_err(|e| format!("mcp socket {}: {e}", sock.display()))?;
-    let mut s = spawn_child(turn, tools, effort, resume, &sock, bridge, parked_rx)?;
+    let bridge = Bridge::bind(parked_tx).map_err(|e| format!("mcp transport: {e}"))?;
+    let endpoint = bridge.endpoint().to_string();
+    let mut s = spawn_child(turn, tools, effort, resume, &endpoint, bridge, parked_rx)?;
     // The bridge is bound before the child spawns; claude's
     // initialize/tools/list can arrive as soon as it mounts `gray`.
     s.bridge.set_tools(s.tools.clone());
@@ -1299,12 +1298,12 @@ fn spawn_child(
     tools: Vec<Value>,
     effort: Option<&str>,
     resume: Option<&ResumePoint>,
-    sock: &std::path::Path,
+    endpoint: &str,
     bridge: Bridge,
     parked_rx: Receiver<String>,
 ) -> Result<LiveSession, String> {
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let argv = argv(turn, &turn.system, effort, sock, resume)?;
+    let argv = argv(turn, &turn.system, effort, endpoint, resume)?;
     let mut child = Command::new(&binary)
         .args(&argv)
         .stdin(Stdio::piped())
@@ -1405,9 +1404,9 @@ fn spawn_idle(rec: &session::Record) -> Option<LiveSession> {
     if !session::session_exists(&rec.sid) {
         return None;
     }
-    let sock = mcp::sock_path();
     let (parked_tx, parked_rx) = channel();
-    let bridge = Bridge::bind(sock.clone(), parked_tx).ok()?;
+    let bridge = Bridge::bind(parked_tx).ok()?;
+    let endpoint = bridge.endpoint().to_string();
     let turn = PreparedTurn {
         system: rec.system.clone(),
         frames: Vec::new(),
@@ -1421,7 +1420,7 @@ fn spawn_idle(rec: &session::Record) -> Option<LiveSession> {
         Vec::new(),
         rec.effort.as_deref(),
         Some(&point),
-        &sock,
+        &endpoint,
         bridge,
         parked_rx,
     )

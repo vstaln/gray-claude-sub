@@ -26,11 +26,19 @@ const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// assistant message to resume at.
 pub type ResumePoint = (String, String);
 
+/// The user's home dir: `$HOME`, or `%USERPROFILE%` on Windows where
+/// HOME isn't set.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 /// `$XDG_CACHE_HOME/claude-sub` (or `~/.cache/claude-sub`).
 pub fn cache_root() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
+        .or_else(|| home_dir().map(|h| h.join(".cache")))
         .unwrap_or_else(std::env::temp_dir)
         .join("claude-sub")
 }
@@ -41,7 +49,7 @@ pub fn projects_root() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude")))
+        .or_else(|| home_dir().map(|h| h.join(".claude")))
         .map(|d| d.join("projects"))
 }
 

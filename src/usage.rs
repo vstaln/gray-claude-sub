@@ -33,8 +33,7 @@ const SESSION_MINS: u64 = 5 * 60;
 const WEEK_MINS: u64 = 7 * 24 * 60;
 
 fn cache_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(home.join(".cache/claude-sub/usage.json"))
+    Some(crate::session::home_dir()?.join(".cache/claude-sub/usage.json"))
 }
 
 fn now_secs() -> u64 {
