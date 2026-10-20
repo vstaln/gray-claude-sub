@@ -27,7 +27,7 @@ fn probe_with_real_login_reports_logged_in() {
         eprintln!("SKIP: no claude binary in this environment");
         return;
     }
-    match probe_login() {
+    match probe_login(None) {
         LoginState::LoggedIn => {}
         LoginState::LoggedOut | LoginState::Unknown => {
             eprintln!("SKIP: claude not logged in (or probe timed out) here");
@@ -45,7 +45,7 @@ fn probe_without_binary_is_unknown() {
     unsafe { std::env::set_var("PATH", &tmp) };
     unsafe { std::env::remove_var("CLAUDE_SUB_COMMAND") };
     unsafe { std::env::remove_var("CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND") };
-    let got = probe_login();
+    let got = probe_login(None);
     if let Some(p) = old_path {
         unsafe { std::env::set_var("PATH", p) };
     }

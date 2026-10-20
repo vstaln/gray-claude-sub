@@ -43,14 +43,23 @@ pub fn cache_root() -> PathBuf {
         .join("claude-sub")
 }
 
-/// The CLI's project store: `$CLAUDE_CONFIG_DIR/projects` or
-/// `~/.claude/projects` (the child inherits `CLAUDE_CONFIG_DIR`).
-pub fn projects_root() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+/// The CLI's config home: `account_home` when a multi-account pick
+/// supplies one ([`crate::accounts`]), else the ambient
+/// `$CLAUDE_CONFIG_DIR` or `~/.claude`.
+pub fn claude_home(account_home: Option<&Path>) -> Option<PathBuf> {
+    account_home
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
         .or_else(|| home_dir().map(|h| h.join(".claude")))
-        .map(|d| d.join("projects"))
+}
+
+/// The CLI's project store under its config home.
+pub fn projects_root(home: Option<&Path>) -> Option<PathBuf> {
+    claude_home(home).map(|d| d.join("projects"))
 }
 
 /// The CLI's project directory name for `cwd`: every UTF-16 unit outside
@@ -216,10 +225,10 @@ pub fn transcript_lines(
 /// Write `frames` as a fresh native session for the current cwd and return
 /// where to resume it. `None` when the CLI's project dir can't be derived
 /// or the file can't be written: the caller falls back to stdin replay.
-pub fn synthesize(frames: &[Value]) -> Option<ResumePoint> {
+pub fn synthesize(frames: &[Value], home: Option<&Path>) -> Option<ResumePoint> {
     let cwd = std::env::current_dir().ok()?;
     let cwd = cwd.to_str()?;
-    let dir = projects_root()?.join(project_dir_name(cwd)?);
+    let dir = projects_root(home)?.join(project_dir_name(cwd)?);
     let sid = new_uuid();
     let (lines, at) = transcript_lines(
         frames,
@@ -241,19 +250,19 @@ pub fn synthesize(frames: &[Value]) -> Option<ResumePoint> {
 }
 
 /// Session file the CLI keeps for `sid` under the current cwd.
-fn session_file(sid: &str) -> Option<PathBuf> {
+fn session_file(sid: &str, home: Option<&Path>) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let name = project_dir_name(cwd.to_str()?)?;
-    Some(projects_root()?.join(name).join(format!("{sid}.jsonl")))
+    Some(projects_root(home)?.join(name).join(format!("{sid}.jsonl")))
 }
 
 /// Delete a throwaway session we created (a keepalive probe's fork): its
 /// transcript, its sidecar directory and its ledger entry. Best-effort.
-pub fn discard(sid: &str) {
+pub fn discard(sid: &str, home: Option<&Path>) {
     if !is_uuid(sid) {
         return;
     }
-    if let Some(path) = session_file(sid) {
+    if let Some(path) = session_file(sid, home) {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(path.with_extension(""));
     }
@@ -269,8 +278,8 @@ pub fn discard(sid: &str) {
 /// resume native re-attaches its own error result to that tool_use, and the
 /// model sees its earlier call fail. Returns whether the session file is
 /// in place and clean (only then is a resume point worth recording).
-pub fn prune_native_tool_results(sid: &str) -> bool {
-    let Some(path) = session_file(sid) else {
+pub fn prune_native_tool_results(sid: &str, home: Option<&Path>) -> bool {
+    let Some(path) = session_file(sid, home) else {
         return false;
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -358,6 +367,23 @@ pub struct Record {
     /// Unix seconds when written; restores the warm-window clock.
     #[serde(default)]
     pub saved_at: u64,
+    /// The credential home (`CLAUDE_CONFIG_DIR`) the session lives in —
+    /// transcripts are per-home, so a resume only works there. Empty on
+    /// records predating multi-account: the ambient home answers.
+    #[serde(default)]
+    pub home: String,
+}
+
+impl Record {
+    /// The credential home this record's transcript lives under: the
+    /// stored path, or the ambient default for pre-multi-account records.
+    pub fn home_path(&self) -> Option<PathBuf> {
+        if self.home.is_empty() {
+            claude_home(None)
+        } else {
+            Some(PathBuf::from(&self.home))
+        }
+    }
 }
 
 fn record_of(text: &str) -> Option<Record> {
@@ -374,10 +400,14 @@ fn record_of(text: &str) -> Option<Record> {
     (is_uuid(&r.sid) && is_uuid(&r.uuid)).then_some(r)
 }
 
-/// The resume point recorded for conversation `key`, if any and well-formed.
-pub fn lookup(key: u64) -> Option<ResumePoint> {
+/// The resume point recorded for conversation `key`, if any and
+/// well-formed — and only when the record's home is the turn's: a
+/// transcript written under one `CLAUDE_CONFIG_DIR` cannot resume
+/// under another.
+pub fn lookup(key: u64, home: Option<&Path>) -> Option<ResumePoint> {
     let text = std::fs::read_to_string(resume_file(key)).ok()?;
-    record_of(&text).map(|r| (r.sid, r.uuid))
+    let r = record_of(&text)?;
+    (r.home_path() == claude_home(home)).then_some((r.sid, r.uuid))
 }
 
 /// The full record for `key`, if the file parses — legacy points fill
@@ -423,7 +453,7 @@ pub fn save_record(key: u64, rec: &Record) {
     if let Ok(text) = serde_json::to_string(rec) {
         let _ = write_atomic(&resume_file(key), text.as_bytes());
         touch_ledger(&rec.sid);
-        if let Some(projects) = projects_root() {
+        if let Some(projects) = rec.home_path().map(|h| h.join("projects")) {
             sweep_if_due(&cache_root(), &projects, SystemTime::now());
         }
     }
@@ -431,8 +461,8 @@ pub fn save_record(key: u64, rec: &Record) {
 
 /// Whether the CLI's transcript for `sid` is still on disk — a record
 /// whose transcript was swept can't resume, so rewarm skips it.
-pub fn session_exists(sid: &str) -> bool {
-    is_uuid(sid) && session_file(sid).is_some_and(|p| p.exists())
+pub fn session_exists(sid: &str, home: Option<&Path>) -> bool {
+    is_uuid(sid) && session_file(sid, home).is_some_and(|p| p.exists())
 }
 
 /// Parse a resume file: `<sid>\n<uuid>\n`, both canonical uuids.
@@ -450,7 +480,7 @@ pub fn save(key: u64, sid: &str, uuid: &str) {
     }
     let _ = write_atomic(&resume_file(key), format!("{sid}\n{uuid}\n").as_bytes());
     touch_ledger(sid);
-    if let Some(projects) = projects_root() {
+    if let Some(projects) = projects_root(None) {
         sweep_if_due(&cache_root(), &projects, SystemTime::now());
     }
 }

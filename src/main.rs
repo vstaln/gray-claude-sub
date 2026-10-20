@@ -18,7 +18,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use claude_sub::{catalog, keepalive, live, manifest, mcp, models, relay, setup, usage};
+use claude_sub::{accounts, catalog, keepalive, live, manifest, mcp, models, relay, setup, usage};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,8 @@ type Relays = relay::Intents;
 fn cli_help() -> String {
     "claude-sub — Claude Pro/Max subscription provider for gray\n\
      usage: claude-sub manifest | sidecar | tools [all|bash|+name|-name|name …]\n\
-     slash:  /claude · /claude tools …"
+              | account [add|list|use|remove|status] …\n\
+     slash:  /claude · /claude tools … · /claude account …"
         .to_string()
 }
 
@@ -83,6 +84,25 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             println!("{}", claude_sub::settings::tools_command(&args));
             return Ok(());
+        }
+        // `gray claude-sub account …`: the multi-account pool — `add`
+        // drives the real `claude auth login` into a fresh credential
+        // home, so it needs this terminal, not the sidecar's NDJSON pipe.
+        Some(a) if a == "account" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            match claude_sub::accounts::command(&args, true) {
+                Ok(text) => {
+                    println!("{text}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
         }
         Some(s) if s == "help" || s == "--help" || s == "-h" => {
             println!("{}", cli_help());
@@ -182,12 +202,20 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             }
             // Sync probe, instant offline read; run inline (spawn_blocking
             // needs 'static + Send, which the borrowed relays map blocks).
-            match setup::probe_login() {
+            // A configured pool probes the serving account's home (or the
+            // first configured one when all are cooling — a login probe
+            // mustn't report the ambient login's state as the pool's).
+            let probe = accounts::probe_home();
+            match setup::probe_login(probe.as_deref()) {
                 setup::LoginState::LoggedIn => Ok(json!({"status": "authenticated"})),
                 setup::LoginState::LoggedOut | setup::LoginState::Unknown => {
-                    Err(ProviderRpcError::Unavailable(
-                        "Claude Code login lives in your terminal: run `claude auth login`, then retry.".into(),
-                    ))
+                    Err(ProviderRpcError::Unavailable(match &probe {
+                        Some(h) => format!(
+                            "the pooled Claude account has no login in {}; re-run `gray claude-sub account add` or adopt one with --home.",
+                            h.display()
+                        ),
+                        None => "Claude Code login lives in your terminal: run `claude auth login`, then retry.".into(),
+                    }))
                 }
             }
         }
@@ -238,7 +266,7 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             ensure_provider(provider, auth_method)?;
-            usage::handle()
+            usage::handle(accounts::probe_pick().as_ref())
         }
         "command/run" => {
             let name = params
@@ -294,14 +322,26 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
             "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
         )));
     }
+    // Multi-account pick (accounts.json absent/empty → None → the ambient
+    // login, unchanged behavior). The choice rides the relay intent so
+    // pool matching, spawning and cooldown bookkeeping all see it.
+    let account = accounts::pick().map_err(ProviderRpcError::Unavailable)?;
     // No login, no relay: `/connect` shows the hint instead of a turn that
-    // dies later. A confirmed login is remembered for this sidecar's life;
-    // an inconclusive probe never blocks a turn.
+    // dies later. A confirmed ambient login is remembered for this
+    // sidecar's life; pooled accounts probe their own home every time —
+    // a global "logged in" verdict would hide a sibling account's gap.
     static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
-        match setup::probe_login() {
+    if account.is_some() || !LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
+        match setup::probe_login(account.as_ref().map(|p| p.home.as_path())) {
             setup::LoginState::LoggedOut => {
-                return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
+                return Err(ProviderRpcError::Unavailable(match &account {
+                    Some(p) => format!(
+                        "Claude account {:?} has no login in {}",
+                        p.label,
+                        p.home.display()
+                    ),
+                    None => setup::LOGIN_HINT.into(),
+                }));
             }
             setup::LoginState::LoggedIn => {
                 LOGGED_IN.store(true, std::sync::atomic::Ordering::Relaxed)
@@ -320,6 +360,7 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     let intent = relay::RelayIntent {
         model: model.clone(),
         effort: effort.clone(),
+        account,
     };
     relays
         .lock()

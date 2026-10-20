@@ -36,6 +36,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -184,6 +185,9 @@ pub struct LiveSession {
     /// claude's own session id, from the stream (debug/trace only).
     sid: String,
     pid: u32,
+    /// The credential home (`CLAUDE_CONFIG_DIR`) this child was spawned
+    /// under — a turn only continues a session on its own account.
+    home: Option<PathBuf>,
     /// Re-pooled from a persisted record after a plugin restart — its
     /// first real turn is the resume's proof: a drain error there means
     /// a stale record, so the request falls back to a fresh child
@@ -208,6 +212,7 @@ struct Busy {
     native_model: String,
     system: String,
     effort: Option<String>,
+    home: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -376,11 +381,16 @@ fn find(
     live: &[LiveSession],
     turn: &PreparedTurn,
     effort: Option<&str>,
+    home: Option<&Path>,
 ) -> Result<(usize, usize, bool), &'static str> {
     let mut reason = "no_session";
     let mut depth = 0;
     for (i, s) in live.iter().enumerate() {
-        let (miss, d) = if s.native_model != turn.native_model {
+        let (miss, d) = if s.home.as_deref() != home {
+            // Sessions never cross accounts: each credential home holds
+            // its own transcript store and upstream quota.
+            ("home", 0)
+        } else if s.native_model != turn.native_model {
             ("model", 1)
         } else if s.system != turn.system {
             ("system", 2)
@@ -433,6 +443,7 @@ fn take(
     turn: &PreparedTurn,
     effort: Option<&str>,
     deadline: Instant,
+    home: Option<&Path>,
 ) -> (Option<(LiveSession, usize, bool)>, &'static str) {
     let wait_deadline = (Instant::now() + KEEPALIVE_WAIT).min(deadline);
     let mut dead = Vec::new();
@@ -440,7 +451,7 @@ fn take(
         let mut pool = locked_pool();
         loop {
             dead.extend(reap(&mut pool));
-            let reason = match find(&pool.live, turn, effort) {
+            let reason = match find(&pool.live, turn, effort, home) {
                 Ok((i, delta_at, undelivered)) => {
                     let s = pool.live.remove(i);
                     break (Some((s, delta_at, undelivered)), "reuse");
@@ -451,6 +462,7 @@ fn take(
                 b.native_model == turn.native_model
                     && b.system == turn.system
                     && b.effort.as_deref() == effort
+                    && b.home.as_deref() == home
             });
             let left = wait_deadline.saturating_duration_since(Instant::now());
             if !warming || SHUTDOWN.load(Ordering::Relaxed) {
@@ -520,6 +532,7 @@ pub(crate) fn take_refresh_candidate() -> Option<LiveSession> {
         native_model: s.native_model.clone(),
         system: s.system.clone(),
         effort: s.effort.clone(),
+        home: s.home.clone(),
     });
     Some(s)
 }
@@ -534,6 +547,9 @@ pub(crate) fn finish_refresh(mut s: LiveSession, err: Option<&str>) {
         Some(e) => {
             if chat::api_error(e).is_some_and(|(c, _)| c == 429) {
                 s.rate_limited = true;
+                if let Some(h) = s.home.as_deref() {
+                    crate::accounts::note_failure_home(h, e);
+                }
             }
             s.failures += 1;
             if !s.settle(e) {
@@ -1038,7 +1054,13 @@ impl LiveSession {
                 // Subscription-quota telemetry: `unifiedWindows` refreshes
                 // every window at once — write-through to the /usage cache
                 // so quota rows stay warm between probes.
-                crate::usage::note_event(&v);
+                crate::usage::note_event(
+                    &v,
+                    self.home
+                        .as_deref()
+                        .and_then(crate::accounts::label_for_home)
+                        .as_deref(),
+                );
             }
             _ => {}
         }
@@ -1373,11 +1395,14 @@ fn spawn_live(
     resume: Option<&ResumePoint>,
     tail: &[Value],
     deadline: Instant,
+    home: Option<&Path>,
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
     let (parked_tx, parked_rx) = channel();
     let bridge = Bridge::bind(parked_tx).map_err(|e| format!("mcp transport: {e}"))?;
     let endpoint = bridge.endpoint().to_string();
-    let mut s = spawn_child(turn, tools, effort, resume, &endpoint, bridge, parked_rx)?;
+    let mut s = spawn_child(
+        turn, tools, effort, resume, &endpoint, bridge, parked_rx, home,
+    )?;
     // The bridge is bound before the child spawns; claude's
     // initialize/tools/list can arrive as soon as it mounts `gray`.
     s.bridge.set_tools(s.tools.clone());
@@ -1412,6 +1437,7 @@ fn spawn_live(
 /// Spawn the `claude` child and wire its stdio, stderr tail and bridge —
 /// everything except history loading and the first drain, which differ
 /// between a turn spawn and an idle re-warm spawn.
+#[allow(clippy::too_many_arguments)]
 fn spawn_child(
     turn: &PreparedTurn,
     tools: Vec<Value>,
@@ -1420,11 +1446,12 @@ fn spawn_child(
     endpoint: &str,
     bridge: Bridge,
     parked_rx: Receiver<String>,
+    home: Option<&Path>,
 ) -> Result<LiveSession, String> {
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let argv = argv(turn, &turn.system, effort, endpoint, resume)?;
-    let mut child = Command::new(&binary)
-        .args(&argv)
+    let mut cmd = Command::new(&binary);
+    cmd.args(&argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1437,9 +1464,13 @@ fn spawn_child(
         // A turn must never pop a browser out of a stale login.
         .env("BROWSER", "/bin/true")
         .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
-        .spawn()
-        .map_err(|_| setup::INSTALL_HINT.to_string())?;
+        .env("WAYLAND_DISPLAY", "");
+    // A pooled account supplies its own credential home; explicit wins
+    // over whatever CLAUDE_CONFIG_DIR `child_env` inherited.
+    if let Some(h) = home {
+        cmd.env("CLAUDE_CONFIG_DIR", h);
+    }
+    let mut child = cmd.spawn().map_err(|_| setup::INSTALL_HINT.to_string())?;
     let pid = child.id();
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(err) = child.stderr.take() {
@@ -1508,6 +1539,7 @@ fn spawn_child(
         rate_limited: false,
         sid: String::new(),
         pid,
+        home: home.map(Path::to_path_buf),
         sent: Vec::new(),
         mid_frames: Vec::new(),
         rewarmed: false,
@@ -1523,7 +1555,8 @@ fn spawn_child(
 /// resume can't mount — the record then degrades back to a plain
 /// cold-start point for [`spawn_conversation`].
 fn spawn_idle(rec: &session::Record) -> Option<LiveSession> {
-    if !session::session_exists(&rec.sid) {
+    let home = rec.home_path();
+    if !session::session_exists(&rec.sid, home.as_deref()) {
         return None;
     }
     let (parked_tx, parked_rx) = channel();
@@ -1545,6 +1578,7 @@ fn spawn_idle(rec: &session::Record) -> Option<LiveSession> {
         &endpoint,
         bridge,
         parked_rx,
+        home.as_deref(),
     )
     .ok()?;
     // A mounted child announces `system/init` then idles on stdin; a
@@ -1617,6 +1651,7 @@ fn spawn_conversation(
     tools: Vec<Value>,
     effort: Option<&str>,
     deadline: Instant,
+    home: Option<&Path>,
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
     let frames = &turn.frames;
     let split = frames
@@ -1629,14 +1664,14 @@ fn spawn_conversation(
         let tail = &frames[split..];
         // Lazily: synthesize writes a transcript file only when the stored
         // point is absent or the resume was refused.
-        let stored = || session::lookup(prev);
-        let synthetic = || session::synthesize(history);
+        let stored = || session::lookup(prev, home);
+        let synthetic = || session::synthesize(history, home);
         for at in [
             &stored as &dyn Fn() -> Option<ResumePoint>,
             &synthetic as &dyn Fn() -> Option<ResumePoint>,
         ] {
             let Some(at) = at() else { continue };
-            match spawn_live_retried(turn, tools.clone(), effort, Some(&at), tail, deadline) {
+            match spawn_live_retried(turn, tools.clone(), effort, Some(&at), tail, deadline, home) {
                 // A refused resume ends Done with an error result and no
                 // assistant line — judge reads it as NO_ANSWER and the
                 // child is a dead end: kill and advance the tier.
@@ -1653,7 +1688,7 @@ fn spawn_conversation(
             }
         }
     }
-    spawn_live_retried(turn, tools, effort, None, frames, deadline)
+    spawn_live_retried(turn, tools, effort, None, frames, deadline, home)
 }
 
 /// One respawn on a fresh socket when the child's `gray` MCP mount failed
@@ -1665,9 +1700,12 @@ fn spawn_live_retried(
     resume: Option<&ResumePoint>,
     tail: &[Value],
     deadline: Instant,
+    home: Option<&Path>,
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
-    match spawn_live(turn, tools.clone(), effort, resume, tail, deadline) {
-        Err(e) if e == MCP_MOUNT_FAILED => spawn_live(turn, tools, effort, resume, tail, deadline),
+    match spawn_live(turn, tools.clone(), effort, resume, tail, deadline, home) {
+        Err(e) if e == MCP_MOUNT_FAILED => {
+            spawn_live(turn, tools, effort, resume, tail, deadline, home)
+        }
         r => r,
     }
 }
@@ -1682,7 +1720,7 @@ fn spawn_live_retried(
 /// fields are exactly what `continuation` will verify next.
 fn record_point(turn: &PreparedTurn, s: &LiveSession, lines: &[Value]) {
     if let Some((sid, uuid)) = chat::resume_point(lines)
-        && session::prune_native_tool_results(&sid)
+        && session::prune_native_tool_results(&sid, s.home.as_deref())
     {
         let mut convo = turn.frames.clone();
         convo.extend(
@@ -1702,6 +1740,11 @@ fn record_point(turn: &PreparedTurn, s: &LiveSession, lines: &[Value]) {
                 absorbed: s.absorbed.clone(),
                 reply_call_ids: s.reply_call_ids.clone(),
                 reply_text: s.reply_text.clone(),
+                home: s
+                    .home
+                    .as_ref()
+                    .map(|h| h.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 saved_at: SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1758,6 +1801,7 @@ pub fn run_turn(
     model: &str,
     effort: Option<&str>,
     timeout: Duration,
+    account_home: Option<&Path>,
 ) -> Result<Vec<Value>, String> {
     if let Some(key) = setup::conflicting_env() {
         return Err(format!(
@@ -1773,8 +1817,11 @@ pub fn run_turn(
             .unwrap_or_default()
             .as_slice(),
     );
+    // The credential home is fixed for the whole turn: pooled sessions,
+    // resume points and spawned children all live under it.
+    let home = session::claude_home(account_home);
     let deadline = Instant::now() + timeout;
-    let (claimed, miss_reason) = take(&turn, effort, deadline);
+    let (claimed, miss_reason) = take(&turn, effort, deadline, home.as_deref());
     let (mut s, applied_to, mode) = match claimed {
         Some((mut s, delta_at, undelivered)) => {
             let names = turn.names.clone();
@@ -1782,7 +1829,8 @@ pub fn run_turn(
             if !s.update_tools(&names, tools.clone()) {
                 // The bridge died: the session can't serve tools anymore.
                 s.close();
-                let (s2, term, lines) = spawn_conversation(&turn, tools, effort, deadline)?;
+                let (s2, term, lines) =
+                    spawn_conversation(&turn, tools, effort, deadline, home.as_deref())?;
                 return finish_spawn(s2, term, lines, &turn, "fresh:bridge_dead");
             }
             match s.route_delta(&turn.input[delta_at..], undelivered, delta_at) {
@@ -1791,20 +1839,23 @@ pub fn run_turn(
                     // The delta doesn't continue this session after all —
                     // give it back untouched and cold-start the request.
                     give_back(s);
-                    let (s2, term, lines) = spawn_conversation(&turn, tools, effort, deadline)?;
+                    let (s2, term, lines) =
+                        spawn_conversation(&turn, tools, effort, deadline, home.as_deref())?;
                     return finish_spawn(s2, term, lines, &turn, "fresh:diverged");
                 }
                 Err(e) => {
                     // Dead wire mid-delta: the request is still
                     // answerable, on a fresh child.
                     s.close();
-                    let (s2, term, lines) = spawn_conversation(&turn, tools, effort, deadline)?;
+                    let (s2, term, lines) =
+                        spawn_conversation(&turn, tools, effort, deadline, home.as_deref())?;
                     return finish_spawn(s2, term, lines, &turn, &format!("fresh:{e}"));
                 }
             }
         }
         None => {
-            let (s, term, lines) = spawn_conversation(&turn, tools, effort, deadline)?;
+            let (s, term, lines) =
+                spawn_conversation(&turn, tools, effort, deadline, home.as_deref())?;
             return finish_spawn(s, term, lines, &turn, &format!("fresh:{miss_reason}"));
         }
     };
@@ -1824,7 +1875,8 @@ pub fn run_turn(
                 // a dead wire here means a stale record, not a turn
                 // failure — the request is still answerable fresh.
                 s.close();
-                let (s2, t2, l2) = spawn_conversation(&turn, tools, effort, deadline)?;
+                let (s2, t2, l2) =
+                    spawn_conversation(&turn, tools, effort, deadline, home.as_deref())?;
                 return finish_spawn(s2, t2, l2, &turn, "fresh:rewarm_dead");
             }
             if s.settle(&e) {
