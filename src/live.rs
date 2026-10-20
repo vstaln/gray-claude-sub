@@ -154,6 +154,11 @@ pub struct LiveSession {
     /// dispatched over the bridge yet. Their host answers pre-seed `auto`,
     /// so the call answers itself the moment it arrives.
     unarrived: HashSet<String>,
+    /// An API message is mid-stream (`message_start` seen, no
+    /// `message_stop` yet). claude dispatches each tool call as soon as
+    /// its block closes, so "every emitted call parked" means nothing
+    /// until the message ends — more `tool_use` blocks may follow.
+    in_msg: bool,
     /// Upstream queries still owed a `result`: live or stdin-queued. A
     /// query parked on tool calls owes nothing until it resumes.
     running: usize,
@@ -911,6 +916,11 @@ impl LiveSession {
             return Err(msg);
         }
         match v.get("type").and_then(Value::as_str) {
+            Some("stream_event") => match v.pointer("/event/type").and_then(Value::as_str) {
+                Some("message_start") => self.in_msg = true,
+                Some("message_stop") => self.in_msg = false,
+                _ => {}
+            },
             Some("system") => {
                 if v.get("subtype").and_then(Value::as_str) == Some("init")
                     && !self.tools.is_empty()
@@ -962,6 +972,7 @@ impl LiveSession {
                 }
             }
             Some("result") => {
+                self.in_msg = false;
                 self.running = self.running.saturating_sub(1);
                 if let Some(sid) = v.get("session_id").and_then(Value::as_str) {
                     self.sid = sid.to_string();
@@ -1106,7 +1117,7 @@ impl LiveSession {
                 // Nothing in flight, nothing parked: turn boundary.
                 return Ok((Term::Done, lines));
             }
-            if !parked.is_empty() && parked.is_superset(&expected) {
+            if !self.in_msg && !parked.is_empty() && parked.is_superset(&expected) {
                 // The front query is waiting on answers only the host has.
                 // Give the stdout pump a beat first — the assistant event
                 // carrying a parked call's tool_use may still be in flight.
@@ -1130,7 +1141,7 @@ impl LiveSession {
                     }
                 }
             }
-            if partial_stall(&parked, &expected, last_progress.elapsed()) {
+            if !self.in_msg && partial_stall(&parked, &expected, last_progress.elapsed()) {
                 // claude is running the batch one call at a time: the rest
                 // only dispatch once the parked ones answer. Hand the host
                 // every emitted call; answers for the undispatched ones
@@ -1144,8 +1155,7 @@ impl LiveSession {
             // The idle cutoff only counts while the child owes stream
             // output — a drain waiting on parked or host-answered tool
             // calls is on the host's clock, not the child's.
-            if parked.is_empty()
-                && self.bridge.unanswered_ids().is_empty()
+            if (self.in_msg || (parked.is_empty() && self.bridge.unanswered_ids().is_empty()))
                 && Instant::now() >= last_progress + self.idle
             {
                 return Err(format!("Claude request idle {}s", self.idle.as_secs()));
@@ -1429,6 +1439,7 @@ fn spawn_child(
         answered: HashSet::new(),
         auto: HashMap::new(),
         unarrived: HashSet::new(),
+        in_msg: false,
         running: 0,
         native_model: turn.native_model.clone(),
         system: turn.system.clone(),
