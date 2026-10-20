@@ -578,6 +578,13 @@ fn dead_wire(e: &str) -> bool {
         && !e.starts_with("native request failed")
 }
 
+/// Reinstalled mid-session (`.new` + `mv`): Linux reports our own exe as
+/// `<path> (deleted)`, which the child can't spawn, so every respawn fails
+/// to mount `gray`. The replacement binary sits at `<path>`.
+fn installed_exe(exe: &str) -> String {
+    exe.strip_suffix(" (deleted)").unwrap_or(exe).to_string()
+}
+
 /// Build the child argv for one live session: the old per-turn flag set
 /// minus `--max-turns` (the MCP park is the tool boundary now) and minus
 /// the `--settings`/`CLAUDE_CODE_EXTRA_BODY` staging (tools arrive via the
@@ -591,6 +598,7 @@ fn argv(
     resume: Option<&ResumePoint>,
 ) -> Result<Vec<String>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+    let exe = installed_exe(&exe.to_string_lossy());
     let mut argv: Vec<String> = vec![
         "-p".into(),
         "--model".into(),
@@ -621,7 +629,7 @@ fn argv(
         "--mcp-config".into(),
         json!({"mcpServers": {"gray": {
             "type": "stdio",
-            "command": exe.to_string_lossy(),
+            "command": exe,
             "args": ["mcp", endpoint],
         }}})
         .to_string(),
@@ -1857,6 +1865,12 @@ fn finish_spawn(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installed_exe_survives_reinstall() {
+        assert_eq!(super::installed_exe("/p/claude-sub (deleted)"), "/p/claude-sub");
+        assert_eq!(super::installed_exe("/p/claude-sub"), "/p/claude-sub");
+    }
+
     use super::*;
 
     fn ids(v: &[&str]) -> HashSet<String> {
