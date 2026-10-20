@@ -497,7 +497,7 @@ pub fn sweep(root: &Path, projects: &Path, now: SystemTime, ttl: Duration) {
             .flatten()
             .map(|e| e.path())
     };
-    for p in entries(root.join("resume")) {
+    for p in entries(root.join("resume")).chain(entries(root.join("mcp-config"))) {
         if idle_past(&p, now, ttl) {
             let _ = std::fs::remove_file(&p);
         }

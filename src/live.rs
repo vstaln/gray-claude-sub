@@ -651,7 +651,8 @@ fn argv(
 /// the cache root and return its path for `--mcp-config`. Claude Code
 /// ≥2.1.303 no longer accepts inline JSON there: the value resolves as a
 /// file path and a nonexistent one is fatal at startup. Files are
-/// unique per spawn and small enough to leave for the cache sweep.
+/// unique per spawn under `mcp-config/`; claude reads them only at
+/// startup, so [`crate::session::sweep`] drops them once idle past TTL.
 fn mcp_config_file(exe: &std::path::Path, endpoint: &str) -> Result<String, String> {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -663,11 +664,13 @@ fn mcp_config_file(exe: &std::path::Path, endpoint: &str) -> Result<String, Stri
         "args": ["mcp", endpoint],
     }}})
     .to_string();
-    let path = crate::session::cache_root().join(format!(
-        "mcp-config-{}-{}.json",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let path = crate::session::cache_root()
+        .join("mcp-config")
+        .join(format!(
+            "{}-{}.json",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("mcp config dir {}: {e}", dir.display()))?;

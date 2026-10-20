@@ -142,6 +142,10 @@ fn sweep_removes_only_idle_ledgered_sessions() {
     std::fs::write(root.join("resume").join("aaaa"), "x").unwrap();
     std::fs::write(root.join("resume").join("bbbb"), "x").unwrap();
     age(&root.join("resume").join("aaaa"), 2 * TTL.as_secs());
+    std::fs::create_dir_all(root.join("mcp-config")).unwrap();
+    std::fs::write(root.join("mcp-config").join("1-0.json"), "{}").unwrap();
+    std::fs::write(root.join("mcp-config").join("2-0.json"), "{}").unwrap();
+    age(&root.join("mcp-config").join("1-0.json"), 2 * TTL.as_secs());
 
     sweep(&root, &projects, SystemTime::now(), TTL);
 
@@ -154,6 +158,8 @@ fn sweep_removes_only_idle_ledgered_sessions() {
     assert!(proj.join(format!("{users}.jsonl")).exists());
     assert!(!root.join("resume").join("aaaa").exists());
     assert!(root.join("resume").join("bbbb").exists());
+    assert!(!root.join("mcp-config").join("1-0.json").exists());
+    assert!(root.join("mcp-config").join("2-0.json").exists());
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(projects).unwrap();
 }
