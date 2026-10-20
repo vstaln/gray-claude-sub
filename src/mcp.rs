@@ -106,8 +106,7 @@ enum Listener {
 /// True on Windows (no unix sockets) or when the TCP transport is forced
 /// for development.
 fn use_tcp() -> bool {
-    cfg!(windows)
-        || std::env::var_os("CLAUDE_SUB_MCP_TRANSPORT").is_some_and(|v| v == "tcp")
+    cfg!(windows) || std::env::var_os("CLAUDE_SUB_MCP_TRANSPORT").is_some_and(|v| v == "tcp")
 }
 
 /// A per-session shared secret for the TCP transport: RandomState's keys
@@ -193,9 +192,7 @@ fn accept(listener: &Listener) -> std::io::Result<Stream> {
 /// before the stdio pump starts.
 fn connect(endpoint: &str) -> std::io::Result<Stream> {
     if let Some(rest) = endpoint.strip_prefix("tcp:") {
-        let bad = || {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad tcp endpoint")
-        };
+        let bad = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad tcp endpoint");
         let (port, token) = rest.split_once(':').ok_or_else(bad)?;
         let port: u16 = port.parse().map_err(|_| bad())?;
         let mut s = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))?;

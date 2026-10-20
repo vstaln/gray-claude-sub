@@ -821,7 +821,11 @@ impl LiveSession {
                         if self.unarrived.remove(id) {
                             // Not dispatched yet: it answers itself on
                             // arrival (on_parked's `auto` path).
-                            let text = if text.is_empty() { "(no output)".into() } else { text };
+                            let text = if text.is_empty() {
+                                "(no output)".into()
+                            } else {
+                                text
+                            };
                             self.auto.insert(
                                 id.to_string(),
                                 json!({"content": [{"type": "text", "text": text}]}),
@@ -1867,7 +1871,10 @@ fn finish_spawn(
 mod tests {
     #[test]
     fn installed_exe_survives_reinstall() {
-        assert_eq!(super::installed_exe("/p/claude-sub (deleted)"), "/p/claude-sub");
+        assert_eq!(
+            super::installed_exe("/p/claude-sub (deleted)"),
+            "/p/claude-sub"
+        );
         assert_eq!(super::installed_exe("/p/claude-sub"), "/p/claude-sub");
     }
 
