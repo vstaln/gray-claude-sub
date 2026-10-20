@@ -1,13 +1,15 @@
 //! The host-tool allowlist the `gray` MCP server advertises upstream.
 //!
-//! Default is bash-only: a harness may carry far more (search, discord,
-//! device tools, …) but a Claude turn sees — and may call — only `bash`.
+//! Default is bash plus the subagent tools: a harness may carry far more
+//! (search, discord, device tools, …) but a Claude turn sees — and may
+//! call — only `bash` and the `subagent_*` / `narrow_delegate` family, so
+//! delegation works on a Claude subscription out of the box.
 //! `/claude tools …` in the REPL (the sidecar's `command/run`) and
 //! `claude-sub tools …` in a shell are the same operation on the same
 //! file, `<gray home>/claude-sub/tools.json`. `chat::prepare_turn`
 //! re-reads it on every request, so a mid-session toggle applies to the
 //! next turn with no respawn, and the file is safe to hand-edit —
-//! missing or corrupt reads fail closed to bash.
+//! missing or corrupt reads fail closed to that default.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -16,8 +18,24 @@ use serde_json::{Value, json};
 
 /// `*` in the allowlist stands for every function tool the host sends.
 const ALL: &str = "*";
-/// The default (and reset) surface.
+/// The strict `/claude tools bash` surface.
 const BASH: &str = "bash";
+/// The default (and `/claude tools default` reset) surface: bash plus the
+/// subagents plugin's delegation tools. A tool the host doesn't send is
+/// simply absent upstream, so listing these costs nothing without the plugin.
+const DEFAULT_TOOLS: &[&str] = &[
+    BASH,
+    "subagent_spawn",
+    "subagent_check",
+    "subagent_message",
+    "subagent_stop",
+    "subagent_note",
+    "narrow_delegate",
+];
+
+fn default_allow() -> BTreeSet<String> {
+    DEFAULT_TOOLS.iter().map(|t| t.to_string()).collect()
+}
 
 /// Which host tools upstream may use. `prepare_turn` advertises only
 /// `allows`-passing tools to the child's `gray` MCP server, and the fold
@@ -29,10 +47,10 @@ pub struct ToolPolicy {
 }
 
 impl Default for ToolPolicy {
-    /// Missing/corrupt file lands here: bash only.
+    /// Missing/corrupt file lands here: bash + subagent tools.
     fn default() -> Self {
         Self {
-            allow: BTreeSet::from([BASH.to_string()]),
+            allow: default_allow(),
         }
     }
 }
@@ -43,7 +61,7 @@ impl ToolPolicy {
         self.allow.contains(ALL) || self.allow.contains(name)
     }
 
-    /// The persisted policy, or the bash-only default. Never errors: a
+    /// The persisted policy, or the default. Never errors: a
     /// turn must never fail on a settings read.
     pub fn load() -> Self {
         let Some(path) = file_path() else {
@@ -124,7 +142,8 @@ const USAGE: &str = "\
 /claude tools — which harness tools the upstream Claude model may call.
   /claude tools          show the current policy
   /claude tools all      allow every harness tool the host sends
-  /claude tools bash     bash only (the default)
+  /claude tools default  bash + subagent tools (the default)
+  /claude tools bash     bash only
   /claude tools +name    also allow one tool, e.g. /claude tools +discord_send
   /claude tools -name    remove one
 /claude account — multiple Claude logins behind this provider
@@ -159,13 +178,14 @@ pub fn tools_command(args: &[String]) -> String {
         match arg.as_str() {
             "all" => policy.allow = BTreeSet::from([ALL.to_string()]),
             "bash" => policy.allow = BTreeSet::from([BASH.to_string()]),
+            "default" => policy.allow = default_allow(),
             _ => {
                 let (add, name) = match arg.strip_prefix('-') {
                     Some(rest) => (false, rest),
                     None => (true, arg.strip_prefix('+').unwrap_or(arg)),
                 };
                 if policy.allow.contains(ALL) {
-                    return "policy is `all`; reset with `/claude tools bash` before \
+                    return "policy is `all`; reset with `/claude tools default` before \
                             editing the list"
                         .to_string();
                 }
@@ -181,10 +201,11 @@ pub fn tools_command(args: &[String]) -> String {
         }
     }
     if policy.allow.is_empty() {
-        return "refusing to write an empty tool list — `/claude tools bash` resets".to_string();
+        return "refusing to write an empty tool list — `/claude tools default` resets".to_string();
     }
     match policy.save() {
         Ok(path) => format!("{}\n(saved to {path})", status_line(&policy)),
         Err(e) => format!("could not save policy: {e}"),
     }
 }
+
