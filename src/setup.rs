@@ -127,6 +127,8 @@ pub fn resolve_command() -> Option<String> {
     } else {
         &["claude", "claude.exe", "claude.cmd"]
     };
+    // Only the windows .cmd branch fills this in.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd_fallback: Option<PathBuf> = None;
     for dir in std::env::split_paths(&path) {
         for name in names {
