@@ -63,6 +63,10 @@ const DRAIN_STEP: Duration = Duration::from_millis(100);
 /// event carrying a parked call's `tool_use` can still be inside the
 /// stdout pump when the socket request lands.
 const CALLS_GRACE: Duration = Duration::from_millis(150);
+/// A front parked on only part of its emitted calls, with the stream
+/// quiet this long, is waiting on the host: claude dispatches the rest
+/// only after the parked ones answer. Return the calls boundary anyway.
+const CALLS_STALL: Duration = Duration::from_secs(3);
 /// A drain dies when the child emits nothing for this long —
 /// `GRAY_CLAUDE_IDLE_SECS` overrides. A slow reply keeps resetting it;
 /// a hung child doesn't stretch it.
@@ -146,6 +150,10 @@ pub struct LiveSession {
     /// resumed session that re-issues a historical `tool_use` gets
     /// answered from here without involving the host.
     auto: HashMap<String, Value>,
+    /// Calls handed to the host at a calls boundary that claude hadn't
+    /// dispatched over the bridge yet. Their host answers pre-seed `auto`,
+    /// so the call answers itself the moment it arrives.
+    unarrived: HashSet<String>,
     /// Upstream queries still owed a `result`: live or stdin-queued. A
     /// query parked on tool calls owes nothing until it resumes.
     running: usize,
@@ -631,6 +639,16 @@ fn argv(
 /// Host tool inventory in MCP schema — BARE names (claude adds the
 /// `mcp__gray__` prefix itself when it shows the tool to the model) and
 /// `inputSchema` (what `tools/list` serves).
+/// The front parked on some — not all — of the calls it emitted and the
+/// stream has been quiet for `CALLS_STALL`: claude is dispatching the
+/// batch serially and waits on the host before sending the rest.
+fn partial_stall(parked: &HashSet<String>, expected: &HashSet<String>, quiet: Duration) -> bool {
+    !parked.is_empty()
+        && !expected.is_empty()
+        && !parked.is_superset(expected)
+        && quiet >= CALLS_STALL
+}
+
 fn tool_inventory(names: &[String], tools: &[Value]) -> Vec<Value> {
     names
         .iter()
@@ -640,7 +658,13 @@ fn tool_inventory(names: &[String], tools: &[Value]) -> Vec<Value> {
                 .find(|t| t.get("name").and_then(Value::as_str) == Some(n));
             json!({"name": n,
                 "description": t.and_then(|t| t.get("description").and_then(Value::as_str)).unwrap_or(""),
-                "inputSchema": t.map(|t| chat::normalize_input_schema(t.get("parameters").unwrap_or(&json!({})))).unwrap_or(json!({}))})
+                "inputSchema": t.map(|t| chat::normalize_input_schema(t.get("parameters").unwrap_or(&json!({})))).unwrap_or(json!({})),
+                // claude only overlaps MCP calls marked read-only; any other
+                // batch runs one call at a time, so the drain would see one
+                // parked call per round. The child never executes these —
+                // it relays them to the host, which owns the real
+                // concurrency policy — so every relayed call may overlap.
+                "annotations": {"readOnlyHint": true}})
         })
         .collect()
 }
@@ -770,10 +794,6 @@ impl LiveSession {
                         // absorb silently — it's not a live parked call.
                         continue;
                     }
-                    let parked = self.bridge.unanswered_ids();
-                    if !parked.contains(id) {
-                        return Ok(Route::Diverge);
-                    }
                     let text = item
                         .get("output")
                         .and_then(Value::as_str)
@@ -783,6 +803,21 @@ impl LiveSession {
                                 .map(|v| v.to_string())
                                 .unwrap_or_default()
                         });
+                    let parked = self.bridge.unanswered_ids();
+                    if !parked.contains(id) {
+                        if self.unarrived.remove(id) {
+                            // Not dispatched yet: it answers itself on
+                            // arrival (on_parked's `auto` path).
+                            let text = if text.is_empty() { "(no output)".into() } else { text };
+                            self.auto.insert(
+                                id.to_string(),
+                                json!({"content": [{"type": "text", "text": text}]}),
+                            );
+                            self.answered.insert(id.to_string());
+                            continue;
+                        }
+                        return Ok(Route::Diverge);
+                    }
                     answers.push((id.to_string(), text));
                 }
                 "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
@@ -826,6 +861,15 @@ impl LiveSession {
             }
         }
         for id in self.bridge.answer_open_error(NOTE_SUPERSEDED) {
+            self.answered.insert(id);
+        }
+        // Undispatched calls the host gave no result for: same treatment,
+        // deferred to arrival — otherwise they'd park the front forever.
+        for id in std::mem::take(&mut self.unarrived) {
+            self.auto.insert(
+                id.clone(),
+                json!({"content": [{"type": "text", "text": NOTE_SUPERSEDED}], "isError": true}),
+            );
             self.answered.insert(id);
         }
         if front_parked {
@@ -1076,6 +1120,7 @@ impl LiveSession {
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         if parked.is_superset(&expected) {
+                            self.unarrived.clear();
                             return Ok((Term::Calls, lines));
                         }
                         continue;
@@ -1084,6 +1129,14 @@ impl LiveSession {
                         return Err("native stdout closed".into());
                     }
                 }
+            }
+            if partial_stall(&parked, &expected, last_progress.elapsed()) {
+                // claude is running the batch one call at a time: the rest
+                // only dispatch once the parked ones answer. Hand the host
+                // every emitted call; answers for the undispatched ones
+                // wait in `auto` (see route_delta).
+                self.unarrived = expected.difference(&parked).cloned().collect();
+                return Ok((Term::Calls, lines));
             }
             if Instant::now() >= deadline {
                 return Err("Claude request timed out".into());
@@ -1375,6 +1428,7 @@ fn spawn_child(
         reply_text: String::new(),
         answered: HashSet::new(),
         auto: HashMap::new(),
+        unarrived: HashSet::new(),
         running: 0,
         native_model: turn.native_model.clone(),
         system: turn.system.clone(),
@@ -1793,6 +1847,33 @@ fn finish_spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn partial_stall_needs_quiet_and_a_partial_park() {
+        let q = CALLS_STALL;
+        // Serial dispatch: one of three parked, stream quiet → boundary.
+        assert!(partial_stall(&ids(&["a"]), &ids(&["a", "b", "c"]), q));
+        // Still streaming / just parked: wait.
+        assert!(!partial_stall(&ids(&["a"]), &ids(&["a", "b"]), q / 2));
+        // All parked is the normal (superset) boundary, not a stall.
+        assert!(!partial_stall(&ids(&["a", "b"]), &ids(&["a", "b"]), q));
+        // Nothing parked: the child owes output — the idle clock's job.
+        assert!(!partial_stall(&ids(&[]), &ids(&["a"]), q));
+        assert!(!partial_stall(&ids(&["a"]), &ids(&[]), q));
+    }
+
+    #[test]
+    fn inventory_marks_relayed_tools_overlappable() {
+        let inv = tool_inventory(
+            &["bash".to_string()],
+            &[json!({"name": "bash", "description": "d", "parameters": {"type": "object"}})],
+        );
+        assert_eq!(inv[0]["annotations"]["readOnlyHint"], json!(true));
+    }
 
     #[test]
     fn echo_records_what_fold_sent() {
