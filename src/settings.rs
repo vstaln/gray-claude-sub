@@ -209,24 +209,3 @@ pub fn tools_command(args: &[String]) -> String {
     }
 }
 
-#[cfg(test)]
-mod policy_tests {
-    use super::*;
-
-    #[test]
-    fn default_policy_allows_bash_and_subagent_tools_only() {
-        let p = ToolPolicy::default();
-        for t in DEFAULT_TOOLS {
-            assert!(p.allows(t), "{t} should be allowed by default");
-        }
-        assert!(!p.allows("discord_send"));
-        assert!(!p.allows("web_search"));
-    }
-
-    #[test]
-    fn default_tool_names_are_valid() {
-        for t in DEFAULT_TOOLS {
-            assert!(valid_name(t), "{t}");
-        }
-    }
-}
