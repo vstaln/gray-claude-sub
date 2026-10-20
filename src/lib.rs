@@ -1,6 +1,7 @@
 //! Library target for `gray-claude-sub`: the protocol-1.2 sidecar plugin
 //! (`claude-sub` binary) for Gray's plugin system.
 
+pub mod accounts;
 pub mod catalog;
 pub mod chat;
 pub mod keepalive;

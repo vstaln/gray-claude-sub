@@ -32,8 +32,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_MINS: u64 = 5 * 60;
 const WEEK_MINS: u64 = 7 * 24 * 60;
 
-fn cache_path() -> Option<PathBuf> {
-    Some(crate::session::home_dir()?.join(".cache/claude-sub/usage.json"))
+fn cache_path(label: Option<&str>) -> Option<PathBuf> {
+    let name = match label {
+        Some(l) => format!("usage-{l}.json"),
+        None => "usage.json".to_string(),
+    };
+    Some(
+        crate::session::home_dir()?
+            .join(".cache/claude-sub")
+            .join(name),
+    )
 }
 
 fn now_secs() -> u64 {
@@ -43,21 +51,24 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// `provider/usage` entry: serve the cache when fresh, else probe.
-pub fn handle() -> Result<Value, ProviderRpcError> {
-    if let Some((limits, fetched)) = read_cache()
+/// `provider/usage` entry: serve the cache when fresh, else probe. A
+/// pooled `account` reads its own cache and probes its own credential
+/// home — one login's quota windows never report another's.
+pub fn handle(account: Option<&crate::accounts::Pick>) -> Result<Value, ProviderRpcError> {
+    let label = account.map(|p| p.label.as_str());
+    if let Some((limits, fetched)) = read_cache(label)
         && now_secs().saturating_sub(fetched) < CACHE_TTL_SECS
     {
         return Ok(limits);
     }
-    match probe() {
+    match probe(account.map(|p| p.home.as_path())) {
         Ok(limits) => {
-            write_cache(&limits, now_secs());
+            write_cache(&limits, now_secs(), label);
             Ok(limits)
         }
         Err(e) => {
             // A stale cache beats nothing: report it with its real age.
-            if let Some((limits, _)) = read_cache() {
+            if let Some((limits, _)) = read_cache(label) {
                 return Ok(limits);
             }
             Err(e)
@@ -65,15 +76,17 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
     }
 }
 
-fn read_cache() -> Option<(Value, u64)> {
-    let s = std::fs::read_to_string(cache_path()?).ok()?;
+fn read_cache(label: Option<&str>) -> Option<(Value, u64)> {
+    let s = std::fs::read_to_string(cache_path(label)?).ok()?;
     let v: Value = serde_json::from_str(&s).ok()?;
     let fetched = v.get("fetched_at").and_then(Value::as_u64)?;
     Some((v.get("limits").cloned()?, fetched))
 }
 
-fn write_cache(limits: &Value, fetched: u64) {
-    let Some(path) = cache_path() else { return };
+fn write_cache(limits: &Value, fetched: u64, label: Option<&str>) {
+    let Some(path) = cache_path(label) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -87,7 +100,7 @@ fn write_cache(limits: &Value, fetched: u64) {
 /// `unifiedWindows` names every window with a 0–1 utilization fraction and
 /// epoch-seconds reset, so one event refreshes the whole panel. Unknown
 /// windows (model-scoped names drift) update in place by id only.
-pub fn note_event(line: &Value) {
+pub fn note_event(line: &Value, label: Option<&str>) {
     let Some(windows) = line
         .get("rate_limit_info")
         .and_then(|i| i.get("unifiedWindows"))
@@ -95,7 +108,7 @@ pub fn note_event(line: &Value) {
     else {
         return;
     };
-    let (mut limits, _) = read_cache().unwrap_or_else(|| {
+    let (mut limits, _) = read_cache(label).unwrap_or_else(|| {
         (
             json!({"available": true, "title": "Claude", "windows": []}),
             0,
@@ -129,32 +142,36 @@ pub fn note_event(line: &Value) {
             }));
         }
     }
-    write_cache(&limits, now_secs());
+    write_cache(&limits, now_secs(), label);
 }
 
 /// The probe: minimal `claude` child (no MCP, no tools) — the control
 /// channel answers `get_usage` without spending tokens.
-fn probe() -> Result<Value, ProviderRpcError> {
+fn probe(home: Option<&std::path::Path>) -> Result<Value, ProviderRpcError> {
     let exe = crate::setup::resolve_command()
         .ok_or_else(|| ProviderRpcError::Unavailable(crate::setup::INSTALL_HINT.into()))?;
-    let mut child = Command::new(exe)
-        .args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--tools",
-            "",
-            "--permission-mode",
-            "dontAsk",
-            "--setting-sources",
-            "",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "",
+        "--permission-mode",
+        "dontAsk",
+        "--setting-sources",
+        "",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    if let Some(h) = home {
+        cmd.env("CLAUDE_CONFIG_DIR", h);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| ProviderRpcError::Unavailable(format!("claude spawn: {e}")))?;
     let deadline = Instant::now() + PROBE_TIMEOUT;

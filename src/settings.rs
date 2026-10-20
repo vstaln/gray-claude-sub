@@ -114,6 +114,7 @@ fn valid_name(name: &str) -> bool {
 pub fn command(argv: &[String]) -> String {
     match argv.first().map(String::as_str) {
         Some("tools") => tools_command(&argv[1..]),
+        Some("account") => crate::accounts::command(&argv[1..], false).unwrap_or_else(|e| e),
         _ => format!("{USAGE}\n\n{}", status_line(&ToolPolicy::load())),
     }
 }
@@ -126,7 +127,13 @@ const USAGE: &str = "\
   /claude tools bash     bash only (the default)
   /claude tools +name    also allow one tool, e.g. /claude tools +discord_send
   /claude tools -name    remove one
-Same from a shell: `gray claude-sub tools …`.";
+/claude account — multiple Claude logins behind this provider
+  /claude account        list accounts and health
+  /claude account status which account serves now
+  /claude account use X  pin account X (use --clear to unpin)
+  /claude account remove X
+Same from a shell: `gray claude-sub tools …` / `gray claude-sub account …`
+(`account add` needs a terminal: `gray claude-sub account add <label>`).";
 
 fn status_line(policy: &ToolPolicy) -> String {
     if policy.allow.contains(ALL) {

@@ -37,6 +37,9 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 pub struct RelayIntent {
     pub model: String,
     pub effort: Option<String>,
+    /// The multi-account pick for this turn — `None` keeps the ambient
+    /// `claude` login (no `accounts.json`).
+    pub account: Option<crate::accounts::Pick>,
 }
 
 pub type Intents = Arc<Mutex<HashMap<String, RelayIntent>>>;
@@ -245,7 +248,24 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
     // One live native session per conversation: a continuing request
     // writes only its delta into the pooled child; tool calls park inside
     // the child's `gray` MCP server until a later turn answers them.
-    let lines = crate::live::run_turn(&body, &intent.model, effort, crate::live::turn_cap())?;
+    let home = intent.account.as_ref().map(|p| p.home.as_path());
+    let result = crate::live::run_turn(&body, &intent.model, effort, crate::live::turn_cap(), home);
+    // Account health rides the verdict: a served answer clears the slate,
+    // an account-scoped upstream failure (401/429) benches the account,
+    // request-scoped failures leave it alone.
+    match &result {
+        Ok(_) => {
+            if let Some(p) = &intent.account {
+                crate::accounts::note_success(&p.label);
+            }
+        }
+        Err(e) => {
+            if let Some(p) = &intent.account {
+                crate::accounts::note_failure(&p.label, e);
+            }
+        }
+    }
+    let lines = result?;
     // The fold's inventory is the advertised set, not the raw request:
     // `/claude tools` narrows what the model may call upstream.
     let policy = crate::settings::ToolPolicy::load();
