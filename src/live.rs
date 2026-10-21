@@ -195,10 +195,12 @@ pub struct LiveSession {
     rewarmed: bool,
     /// Frames written this turn, for the `CLAUDE_SUB_DEBUG` dump.
     sent: Vec<Value>,
-    /// Contents of user frames written while the front query was parked.
-    /// claude's replay of each one says where it landed: inside the
-    /// still-running query (no result of its own) or as a new query.
-    mid_frames: Vec<Value>,
+    /// Mid-query user frames awaiting their `isReplay` echo: (uuid sent
+    /// outbound, replayed-content key as the fallback for an echo
+    /// without one). claude's replay of each says where it landed:
+    /// inside the still-running query (no result of its own) or as a
+    /// new query.
+    mid_frames: Vec<(String, Value)>,
     /// No-activity window before a drain gives up; stream progress
     /// resets it. `deadline` remains the absolute cap.
     idle: Duration,
@@ -751,16 +753,19 @@ impl LiveSession {
     }
 
     /// A querying user frame: merged content blocks (text + Anthropic
-    /// image blocks) as one stdin `user` message.
-    fn send_user(&mut self, blocks: Vec<Value>) -> Result<(), String> {
-        let frame = json!({"type": "user",
+    /// image blocks) as one stdin `user` message. The `uuid` round-trips
+    /// verbatim on claude's `isReplay` echo: content drifts (images get
+    /// re-encoded), identity doesn't.
+    fn send_user(&mut self, blocks: Vec<Value>) -> Result<String, String> {
+        let uuid = session::new_uuid();
+        let frame = json!({"type": "user", "uuid": uuid,
             "message": {"role": "user", "content": blocks}});
         self.send(&frame)?;
         if std::env::var_os("CLAUDE_SUB_DEBUG").is_some() {
             self.sent.push(frame);
         }
         self.running += 1;
-        Ok(())
+        Ok(uuid)
     }
 
     /// Write history frames on a cold session: every user frame but the
@@ -903,8 +908,9 @@ impl LiveSession {
         // claude queues it and attaches it at the tool boundary, so the
         // model's very next step sees it as a real user message.
         if front_parked && !user_blocks.is_empty() {
-            self.mid_frames.push(Value::Array(user_blocks.clone()));
-            self.send_user(std::mem::take(&mut user_blocks))?;
+            let key = replay_key(&Value::Array(user_blocks.clone()));
+            let uuid = self.send_user(std::mem::take(&mut user_blocks))?;
+            self.mid_frames.push((uuid, key));
         }
         // Any parked call the host produced no result for gets an error
         // answer — leaving it parked would block the front forever.
@@ -1033,8 +1039,7 @@ impl LiveSession {
                 }
             }
             Some("user") if v.get("isReplay").and_then(Value::as_bool) == Some(true) => {
-                let content = v.pointer("/message/content").unwrap_or(&Value::Null);
-                if let Some(k) = self.mid_frames.iter().position(|c| c == content) {
+                if let Some(k) = mid_frame_pos(&self.mid_frames, &v) {
                     self.mid_frames.remove(k);
                     if self.running > 1 {
                         // Consumed before the front's result: merged into
@@ -1786,6 +1791,38 @@ fn dump_debug(sent: &[Value], lines: &[Value], meta: &Value) {
     }
 }
 
+/// Identity of a user frame as claude replays it: claude re-encodes
+/// images (a 1920x1080 PNG comes back as a resized JPEG), so image blocks
+/// compare by position only and every other block compares exactly.
+fn replay_key(content: &Value) -> Value {
+    match content {
+        Value::Array(blocks) => Value::Array(
+            blocks
+                .iter()
+                .map(|b| match b.get("type").and_then(Value::as_str) {
+                    Some("image") => json!({"type": "image"}),
+                    _ => b.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Position of the mid-query frame an `isReplay` echo settles. The
+/// echoed `uuid` is authoritative — content is only a fallback for an
+/// echo without one, so a replayed lookalike can't settle the wrong
+/// frame.
+fn mid_frame_pos(frames: &[(String, Value)], echo: &Value) -> Option<usize> {
+    match echo.get("uuid").and_then(Value::as_str) {
+        Some(u) => frames.iter().position(|(uu, _)| uu.as_str() == u),
+        None => {
+            let content = replay_key(echo.pointer("/message/content").unwrap_or(&Value::Null));
+            frames.iter().position(|(_, key)| *key == content)
+        }
+    }
+}
+
 fn debug_on() -> bool {
     std::env::var_os("CLAUDE_SUB_DEBUG").is_some()
 }
@@ -2011,6 +2048,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn replay_key_matches_a_reencoded_image_frame() {
+        let sent = json!([
+            {"type": "text", "text": "Shown: /tmp/s3.png"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+        ]);
+        let replayed = json!([
+            {"type": "text", "text": "Shown: /tmp/s3.png"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4"}}
+        ]);
+        assert_eq!(replay_key(&sent), replay_key(&replayed));
+        let other = json!([{"type": "text", "text": "different"}, replayed[1].clone()]);
+        assert_ne!(replay_key(&sent), replay_key(&other));
+    }
+
+    #[test]
+    fn mid_frame_pos_prefers_the_echoed_uuid() {
+        let text = json!([{"type": "text", "text": "same"}]);
+        let frames = vec![
+            ("u1".to_string(), replay_key(&text)),
+            ("u2".to_string(), replay_key(&text)),
+        ];
+        // Identical contents disambiguate by uuid alone.
+        let echo = json!({"type": "user", "isReplay": true, "uuid": "u2",
+            "message": {"content": text}});
+        assert_eq!(mid_frame_pos(&frames, &echo), Some(1));
+        // An unknown uuid settles nothing even when content matches.
+        let echo = json!({"uuid": "u3", "message": {"content": text}});
+        assert_eq!(mid_frame_pos(&frames, &echo), None);
+        // No uuid at all: content is the fallback.
+        let echo = json!({"message": {"content": text}});
+        assert_eq!(mid_frame_pos(&frames, &echo), Some(0));
+    }
 
     fn ids(v: &[&str]) -> HashSet<String> {
         v.iter().map(|s| s.to_string()).collect()
