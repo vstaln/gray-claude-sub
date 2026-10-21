@@ -1803,6 +1803,36 @@ pub fn run_turn(
     timeout: Duration,
     account_home: Option<&Path>,
 ) -> Result<Vec<Value>, String> {
+    let first = run_turn_once(body, model, effort, timeout, account_home);
+    match &first {
+        // A 401 on a long-lived child usually means its in-memory OAuth
+        // state went stale: several children share one credential home and
+        // a sibling's refresh rotated the token out from under it. The
+        // failing session was closed, not pooled, so this retry cold-starts
+        // a fresh `claude`, which re-reads the credential file on disk.
+        // A second 401 is a genuinely dead login and goes through as-is.
+        Err(e) if is_auth_401(e) => {
+            if debug_on() {
+                eprintln!("claude-sub: 401 on a live child; retrying once on a fresh child");
+            }
+            std::thread::sleep(Duration::from_secs(2));
+            run_turn_once(body, model, effort, timeout, account_home)
+        }
+        _ => first,
+    }
+}
+
+fn is_auth_401(e: &str) -> bool {
+    chat::api_error(e).is_some_and(|(c, _)| c == 401)
+}
+
+fn run_turn_once(
+    body: &Value,
+    model: &str,
+    effort: Option<&str>,
+    timeout: Duration,
+    account_home: Option<&Path>,
+) -> Result<Vec<Value>, String> {
     if let Some(key) = setup::conflicting_env() {
         return Err(format!(
             "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
@@ -1879,7 +1909,9 @@ pub fn run_turn(
                     spawn_conversation(&turn, tools, effort, deadline, home.as_deref())?;
                 return finish_spawn(s2, t2, l2, &turn, "fresh:rewarm_dead");
             }
-            if s.settle(&e) {
+            if is_auth_401(&e) {
+                s.close();
+            } else if s.settle(&e) {
                 give_back(s);
             }
             return Err(e);
@@ -1902,6 +1934,10 @@ pub fn run_turn(
         // Settled upstream state: keep the session with the absorb state
         // that matched this turn, so an identical retry re-prompts the
         // same delta.
+        if is_auth_401(&e) {
+            s.close();
+            return Err(e);
+        }
         if chat::api_error(&e).is_some_and(|(c, _)| c == 429) {
             s.rate_limited = true;
         }
@@ -1934,7 +1970,7 @@ fn finish_spawn(
     match term {
         Term::Done => {
             if let Err(e) = chat::judge(&lines, true) {
-                if dead_wire(&e) {
+                if dead_wire(&e) || is_auth_401(&e) {
                     s.close();
                 } else {
                     // Settled upstream failure on a fresh child: the input
