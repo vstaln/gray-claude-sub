@@ -52,11 +52,9 @@ impl ToolPolicy {
     }
 
     fn matches_pattern(&self, name: &str) -> bool {
-        self.allow.iter().any(|p| {
-            p.len() > 1
-                && p.ends_with('*')
-                && name.starts_with(&p[..p.len() - 1])
-        })
+        self.allow
+            .iter()
+            .any(|p| p.len() > 1 && p.ends_with('*') && name.starts_with(&p[..p.len() - 1]))
     }
 
     /// The persisted policy, or the bash-only default. Never errors: a

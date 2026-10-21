@@ -182,7 +182,11 @@ fn handle_conn(
             // A 400 (model refused for this plan, malformed request) is just
             // as final: streamed, the host would retry it into its budget.
             if let Some((code @ (400 | 401 | 403), msg)) = crate::chat::api_error(&detail) {
-                let kind = if code == 400 { "invalid_request_error" } else { "authentication_error" };
+                let kind = if code == 400 {
+                    "invalid_request_error"
+                } else {
+                    "authentication_error"
+                };
                 let body = json!({"type": "error", "error": {
                     "type": kind, "message": msg}});
                 write_resp(s, code, body.to_string().as_bytes());
