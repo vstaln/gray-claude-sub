@@ -644,6 +644,17 @@ pub(crate) fn rate_limit_rejection(v: &Value) -> Option<String> {
     if info.get("status").and_then(Value::as_str) != Some("rejected") {
         return None;
     }
+    // Model gated behind paid usage credits (e.g. Fable on Pro): not a
+    // quota window — nothing resets, so a "usage limit · resets in …"
+    // sentence would be wrong, and hosts that treat quota as an auth
+    // failure would tell the user their login is broken. Report it as a
+    // request-scoped model refusal: no account cooldown, no retry.
+    if info.get("errorCode").and_then(Value::as_str) == Some("credits_required") {
+        return Some(format!(
+            "{API_ERROR}400: model not supported on this Claude plan: it requires usage \
+             credits (claude.ai/settings/usage). Switch model with /models."
+        ));
+    }
     let kind = info
         .get("rateLimitType")
         .and_then(Value::as_str)
