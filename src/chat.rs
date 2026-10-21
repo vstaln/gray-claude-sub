@@ -175,7 +175,15 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
             if !policy.allows(name) {
                 continue;
             }
-            check_tool_name(name, &seen_names)?;
+            // Wildcard-admitted tools (`mcp__*`, `all`) are best-effort: one
+            // overlong or duplicate name is dropped, it never fails the turn.
+            if let Err(e) = check_tool_name(name, &seen_names) {
+                if policy.allows_by_pattern_only(name) {
+                    eprintln!("claude-sub: skipping tool {name:?}: {e}");
+                    continue;
+                }
+                return Err(e);
+            }
             seen_names.insert(name.to_string());
             names.push(name.to_string());
             tool_index.insert(name.to_string(), format!("{TOOL_PREFIX}{name}"));

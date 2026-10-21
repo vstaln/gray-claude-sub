@@ -38,9 +38,25 @@ impl Default for ToolPolicy {
 }
 
 impl ToolPolicy {
-    /// `name` may run upstream: it's listed, or the policy is `all`.
+    /// `name` may run upstream: it's listed, matches a `prefix*` entry
+    /// (e.g. `mcp__*` for every MCP tool), or the policy is `all`.
     pub fn allows(&self, name: &str) -> bool {
-        self.allow.contains(ALL) || self.allow.contains(name)
+        self.allow.contains(ALL) || self.allow.contains(name) || self.matches_pattern(name)
+    }
+
+    /// `name` is covered only by a `prefix*` entry (or `all`), not listed
+    /// by its exact name. Such tools are skipped, never fatal, when their
+    /// name can't be advertised upstream.
+    pub fn allows_by_pattern_only(&self, name: &str) -> bool {
+        !self.allow.contains(name) && (self.allow.contains(ALL) || self.matches_pattern(name))
+    }
+
+    fn matches_pattern(&self, name: &str) -> bool {
+        self.allow.iter().any(|p| {
+            p.len() > 1
+                && p.ends_with('*')
+                && name.starts_with(&p[..p.len() - 1])
+        })
     }
 
     /// The persisted policy, or the bash-only default. Never errors: a
@@ -61,7 +77,7 @@ impl ToolPolicy {
             .map(|a| {
                 a.iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
-                    .filter(|name| valid_name(name) || name == ALL)
+                    .filter(|name| valid_entry(name))
                     .collect()
             })
             .unwrap_or_default();
@@ -107,6 +123,15 @@ fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// A policy entry: a tool name, `*`, or a `prefix*` pattern.
+fn valid_entry(name: &str) -> bool {
+    name == ALL
+        || valid_name(name)
+        || name
+            .strip_suffix('*')
+            .is_some_and(|prefix| valid_name(prefix))
+}
+
 /// The `/claude` command body: `tools` runs the policy command, anything
 /// else prints usage plus the current policy. A bare `/claude` never
 /// reaches this — `manifest::run_command` leaves it unanswered so the
@@ -126,6 +151,7 @@ const USAGE: &str = "\
   /claude tools all      allow every harness tool the host sends
   /claude tools bash     bash only (the default)
   /claude tools +name    also allow one tool, e.g. /claude tools +discord_send
+  /claude tools +mcp__*  allow every MCP server tool (any `prefix*` works)
   /claude tools -name    remove one
 /claude account — multiple Claude logins behind this provider
   /claude account        list accounts and health
@@ -169,7 +195,7 @@ pub fn tools_command(args: &[String]) -> String {
                             editing the list"
                         .to_string();
                 }
-                if !valid_name(name) {
+                if !valid_entry(name) || name == ALL {
                     return format!("bad tool name: {arg}");
                 }
                 if add {
@@ -186,5 +212,35 @@ pub fn tools_command(args: &[String]) -> String {
     match policy.save() {
         Ok(path) => format!("{}\n(saved to {path})", status_line(&policy)),
         Err(e) => format!("could not save policy: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+
+    fn policy(entries: &[&str]) -> ToolPolicy {
+        ToolPolicy {
+            allow: entries.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn prefix_pattern_admits_mcp_tools_only() {
+        let p = policy(&["bash", "mcp__*"]);
+        assert!(p.allows("bash"));
+        assert!(p.allows("mcp__treg__balance"));
+        assert!(!p.allows("discord_send"));
+        assert!(p.allows_by_pattern_only("mcp__treg__balance"));
+        assert!(!p.allows_by_pattern_only("bash"));
+    }
+
+    #[test]
+    fn entries_accept_patterns_but_not_junk() {
+        assert!(valid_entry("mcp__*"));
+        assert!(valid_entry("*"));
+        assert!(valid_entry("bash"));
+        assert!(!valid_entry("**"));
+        assert!(!valid_entry("mcp *"));
     }
 }
