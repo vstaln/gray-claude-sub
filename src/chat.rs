@@ -339,6 +339,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     // our own native messages replace the re-derived assistant frames when
     // the visible projection still matches (host compaction owns history).
     restore_carriers(&input, &mut frames, model);
+    hoist_tool_results(&mut frames);
     let Some(last) = frames.last() else {
         return Err("history must end in a nonempty user/tool-result message".into());
     };
@@ -360,6 +361,54 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         names,
         native_model: crate::catalog::native_model(model)?,
     })
+}
+
+/// The API wants every `tool_result` at the head of its user message: a
+/// block between two results makes it reject the later ones as missing
+/// ("tool_use ids were found without tool_result blocks immediately after",
+/// which native reports as "400 due to tool use concurrency issues"). The
+/// host follows each tool output with that tool's media, and once media is
+/// elided it arrives as a text stub, which the image fold above skips. So a
+/// block sandwiched between results folds into the result before it (it is
+/// that tool's attachment); any other stray block moves after the results.
+fn hoist_tool_results(frames: &mut [Value]) {
+    let is_result = |b: &Value| b.get("type").and_then(Value::as_str) == Some("tool_result");
+    for f in frames.iter_mut() {
+        if f.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(arr) = f.pointer_mut("/message/content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let Some(last_result) = arr.iter().rposition(is_result) else {
+            continue;
+        };
+        if arr[..last_result].iter().all(is_result) {
+            continue;
+        }
+        let mut results: Vec<Value> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for (i, b) in std::mem::take(arr).into_iter().enumerate() {
+            if is_result(&b) {
+                results.push(b);
+                continue;
+            }
+            if i < last_result
+                && let Some(tr) = results.last_mut()
+            {
+                if let Some(t) = tr["content"].as_str() {
+                    tr["content"] = json!([{"type": "text", "text": t}]);
+                }
+                if let Some(parts) = tr["content"].as_array_mut() {
+                    parts.push(b);
+                    continue;
+                }
+            }
+            rest.push(b);
+        }
+        results.extend(rest);
+        *arr = results;
+    }
 }
 
 fn restore_carriers(input: &[Value], frames: &mut [Value], model: &str) {

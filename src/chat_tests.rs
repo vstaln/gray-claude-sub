@@ -332,6 +332,32 @@ fn input_images_become_native_image_blocks() {
 }
 
 #[test]
+fn parallel_results_with_elided_media_stay_at_message_head() {
+    // Two parallel views whose images were elided to text stubs: each stub
+    // follows its own output, so it sat between the results (a 400 natively).
+    let stub = |n: &str| json!({"role": "user", "content": [{"type": "input_text", "text": format!("[image/png elided {n}]")}]});
+    let b = body(vec![
+        json!({"role": "user", "content": "look"}),
+        json!({"type": "function_call", "call_id": "c1", "name": "view", "arguments": "{}"}),
+        json!({"type": "function_call", "call_id": "c2", "name": "view", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "c1", "output": "Shown: a.png"}),
+        stub("a"),
+        json!({"type": "function_call_output", "call_id": "c2", "output": "Shown: b.png"}),
+        stub("b"),
+        json!({"role": "user", "content": "go on"}),
+    ]);
+    let turn = prepare_turn(&b, "sonnet").unwrap();
+    let last = turn.frames[2]["message"]["content"].as_array().unwrap();
+    let kinds: Vec<&str> = last.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["tool_result", "tool_result", "text", "text"]);
+    // The sandwiched stub folds into its own call's result.
+    assert_eq!(last[0]["tool_use_id"], "c1");
+    assert_eq!(last[0]["content"][1]["text"], "[image/png elided a]");
+    assert_eq!(last[1]["tool_use_id"], "c2");
+    assert_eq!(last[1]["content"], "Shown: b.png");
+}
+
+#[test]
 fn carrier_restores_partial_message_natives() {
     // --include-partial-messages saves one native line per content block
     // (same message id). A text turn's carrier is [thinking, text]: the
