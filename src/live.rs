@@ -208,13 +208,38 @@ pub struct LiveSession {
 
 /// Enough of a checked-out session to guess whether a turn could use it:
 /// the real continuation check runs once it's back in the pool. `pid`
-/// identifies the child for removal on return.
+/// identifies the child for removal on return; `absorbed` is the request
+/// it was serving (a follow-up can only continue it if the input carries
+/// that prefix); `at` bounds how long a leaked entry can stall takes.
 struct Busy {
     pid: u32,
     native_model: String,
     system: String,
     effort: Option<String>,
     home: Option<PathBuf>,
+    absorbed: Vec<Value>,
+    at: Instant,
+}
+
+/// Snapshot a checked-out session for the `busy` list.
+fn busy_entry(s: &LiveSession, absorbed: Vec<Value>) -> Busy {
+    Busy {
+        pid: s.pid,
+        native_model: s.native_model.clone(),
+        system: s.system.clone(),
+        effort: s.effort.clone(),
+        home: s.home.clone(),
+        absorbed,
+        at: Instant::now(),
+    }
+}
+
+/// Could `input` continue a session serving `absorbed`? The real
+/// continuation check needs the session back; for the wait decision an
+/// absorbed-prefix is enough — anything else can't match once it
+/// returns, so waiting on it would just stall an unrelated conversation.
+fn could_continue(absorbed: &[Value], input: &[Value]) -> bool {
+    absorbed.len() <= input.len() && input[..absorbed.len()] == *absorbed
 }
 
 #[derive(Default)]
@@ -254,6 +279,11 @@ fn reap(pool: &mut Pool) -> Vec<LiveSession> {
             i += 1;
         }
     }
+    // A checked-out session that never returns leaves its busy marker;
+    // past the turn cap it can only be leaked — drop it so matching
+    // takes stop stalling on a session that's gone.
+    pool.busy
+        .retain(|b| b.at.elapsed() <= turn_cap() + KEEPALIVE_WAIT);
     dead
 }
 
@@ -456,6 +486,12 @@ fn take(
             let reason = match find(&pool.live, turn, effort, home) {
                 Ok((i, delta_at, undelivered)) => {
                     let s = pool.live.remove(i);
+                    // A claimed turn session is busy too: a follow-up
+                    // that continues it waits for the in-flight turn to
+                    // return it (its reply may arrive undelivered and
+                    // still answer warm) instead of cold-starting and
+                    // re-billing the transcript.
+                    pool.busy.push(busy_entry(&s, turn.input.clone()));
                     break (Some((s, delta_at, undelivered)), "reuse");
                 }
                 Err(reason) => reason,
@@ -465,6 +501,7 @@ fn take(
                     && b.system == turn.system
                     && b.effort.as_deref() == effort
                     && b.home.as_deref() == home
+                    && could_continue(&b.absorbed, &turn.input)
             });
             let left = wait_deadline.saturating_duration_since(Instant::now());
             if !warming || SHUTDOWN.load(Ordering::Relaxed) {
@@ -529,13 +566,7 @@ pub(crate) fn take_refresh_candidate() -> Option<LiveSession> {
         )
     })?;
     let s = pool.live.remove(i);
-    pool.busy.push(Busy {
-        pid: s.pid,
-        native_model: s.native_model.clone(),
-        system: s.system.clone(),
-        effort: s.effort.clone(),
-        home: s.home.clone(),
-    });
+    pool.busy.push(busy_entry(&s, s.absorbed.clone()));
     Some(s)
 }
 
@@ -1344,6 +1375,18 @@ impl LiveSession {
 impl Drop for LiveSession {
     fn drop(&mut self) {
         self.close();
+        // Dropped while checked out: clear its busy marker so waiting
+        // takes stop waiting. `try_lock` keeps a hypothetical drop
+        // under the pool lock from deadlocking — the reap prune is the
+        // backstop for whatever this misses.
+        if let Some(pool) = POOL.get()
+            && let Ok(mut p) = pool.try_lock()
+            && p.busy.iter().any(|b| b.pid == self.pid)
+        {
+            p.busy.retain(|b| b.pid != self.pid);
+            drop(p);
+            POOL_CHANGED.notify_all();
+        }
     }
 }
 
@@ -1651,7 +1694,24 @@ fn classify(lines: &[Value]) -> Option<String> {
 /// three-tier cold start — stored resume point, synthetic transcript,
 /// stdin replay — where a refused resume (no request spent) advances the
 /// tier and anything else surfaces.
+/// Spawn + mark the session busy: its first turn drains checked out,
+/// and a follow-up that continues it waits for it to pool — an
+/// interrupted first turn finishes undelivered but still answers the
+/// next request warm. [`reap`]/[`give_back`]/[`LiveSession::drop`]
+/// clear the marker.
 fn spawn_conversation(
+    turn: &PreparedTurn,
+    tools: Vec<Value>,
+    effort: Option<&str>,
+    deadline: Instant,
+    home: Option<&Path>,
+) -> Result<(LiveSession, Term, Vec<Value>), String> {
+    let out = spawn_conversation_tiered(turn, tools, effort, deadline, home)?;
+    locked_pool().busy.push(busy_entry(&out.0, turn.input.clone()));
+    Ok(out)
+}
+
+fn spawn_conversation_tiered(
     turn: &PreparedTurn,
     tools: Vec<Value>,
     effort: Option<&str>,
@@ -2168,6 +2228,22 @@ mod tests {
     fn assistant_msg(text: &str) -> Value {
         json!({"type": "message", "role": "assistant",
             "content": [{"type": "output_text", "text": text}]})
+    }
+
+    #[test]
+    fn could_continue_needs_the_absorbed_prefix() {
+        let absorbed = vec![user_msg("hi"), assistant_msg("a")];
+        // A follow-up extends it.
+        let mut next = absorbed.clone();
+        next.push(user_msg("and?"));
+        assert!(could_continue(&absorbed, &next));
+        // The identical retry does too.
+        assert!(could_continue(&absorbed, &absorbed));
+        // A forked or different conversation doesn't.
+        assert!(!could_continue(&absorbed, &[user_msg("other")]));
+        assert!(!could_continue(&absorbed, &absorbed[..1]));
+        // An empty absorbed prefix never blocks a wait.
+        assert!(could_continue(&[], &next));
     }
 
     #[test]
