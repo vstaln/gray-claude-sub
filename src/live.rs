@@ -195,10 +195,12 @@ pub struct LiveSession {
     rewarmed: bool,
     /// Frames written this turn, for the `CLAUDE_SUB_DEBUG` dump.
     sent: Vec<Value>,
-    /// Contents of user frames written while the front query was parked.
-    /// claude's replay of each one says where it landed: inside the
-    /// still-running query (no result of its own) or as a new query.
-    mid_frames: Vec<Value>,
+    /// Mid-query user frames awaiting their `isReplay` echo: (uuid sent
+    /// outbound, replayed-content key as the fallback for an echo
+    /// without one). claude's replay of each says where it landed:
+    /// inside the still-running query (no result of its own) or as a
+    /// new query.
+    mid_frames: Vec<(String, Value)>,
     /// No-activity window before a drain gives up; stream progress
     /// resets it. `deadline` remains the absolute cap.
     idle: Duration,
@@ -206,13 +208,38 @@ pub struct LiveSession {
 
 /// Enough of a checked-out session to guess whether a turn could use it:
 /// the real continuation check runs once it's back in the pool. `pid`
-/// identifies the child for removal on return.
+/// identifies the child for removal on return; `absorbed` is the request
+/// it was serving (a follow-up can only continue it if the input carries
+/// that prefix); `at` bounds how long a leaked entry can stall takes.
 struct Busy {
     pid: u32,
     native_model: String,
     system: String,
     effort: Option<String>,
     home: Option<PathBuf>,
+    absorbed: Vec<Value>,
+    at: Instant,
+}
+
+/// Snapshot a checked-out session for the `busy` list.
+fn busy_entry(s: &LiveSession, absorbed: Vec<Value>) -> Busy {
+    Busy {
+        pid: s.pid,
+        native_model: s.native_model.clone(),
+        system: s.system.clone(),
+        effort: s.effort.clone(),
+        home: s.home.clone(),
+        absorbed,
+        at: Instant::now(),
+    }
+}
+
+/// Could `input` continue a session serving `absorbed`? The real
+/// continuation check needs the session back; for the wait decision an
+/// absorbed-prefix is enough — anything else can't match once it
+/// returns, so waiting on it would just stall an unrelated conversation.
+fn could_continue(absorbed: &[Value], input: &[Value]) -> bool {
+    absorbed.len() <= input.len() && input[..absorbed.len()] == *absorbed
 }
 
 #[derive(Default)]
@@ -252,6 +279,11 @@ fn reap(pool: &mut Pool) -> Vec<LiveSession> {
             i += 1;
         }
     }
+    // A checked-out session that never returns leaves its busy marker;
+    // past the turn cap it can only be leaked — drop it so matching
+    // takes stop stalling on a session that's gone.
+    pool.busy
+        .retain(|b| b.at.elapsed() <= turn_cap() + KEEPALIVE_WAIT);
     dead
 }
 
@@ -454,6 +486,12 @@ fn take(
             let reason = match find(&pool.live, turn, effort, home) {
                 Ok((i, delta_at, undelivered)) => {
                     let s = pool.live.remove(i);
+                    // A claimed turn session is busy too: a follow-up
+                    // that continues it waits for the in-flight turn to
+                    // return it (its reply may arrive undelivered and
+                    // still answer warm) instead of cold-starting and
+                    // re-billing the transcript.
+                    pool.busy.push(busy_entry(&s, turn.input.clone()));
                     break (Some((s, delta_at, undelivered)), "reuse");
                 }
                 Err(reason) => reason,
@@ -463,6 +501,7 @@ fn take(
                     && b.system == turn.system
                     && b.effort.as_deref() == effort
                     && b.home.as_deref() == home
+                    && could_continue(&b.absorbed, &turn.input)
             });
             let left = wait_deadline.saturating_duration_since(Instant::now());
             if !warming || SHUTDOWN.load(Ordering::Relaxed) {
@@ -527,13 +566,7 @@ pub(crate) fn take_refresh_candidate() -> Option<LiveSession> {
         )
     })?;
     let s = pool.live.remove(i);
-    pool.busy.push(Busy {
-        pid: s.pid,
-        native_model: s.native_model.clone(),
-        system: s.system.clone(),
-        effort: s.effort.clone(),
-        home: s.home.clone(),
-    });
+    pool.busy.push(busy_entry(&s, s.absorbed.clone()));
     Some(s)
 }
 
@@ -751,16 +784,19 @@ impl LiveSession {
     }
 
     /// A querying user frame: merged content blocks (text + Anthropic
-    /// image blocks) as one stdin `user` message.
-    fn send_user(&mut self, blocks: Vec<Value>) -> Result<(), String> {
-        let frame = json!({"type": "user",
+    /// image blocks) as one stdin `user` message. The `uuid` round-trips
+    /// verbatim on claude's `isReplay` echo: content drifts (images get
+    /// re-encoded), identity doesn't.
+    fn send_user(&mut self, blocks: Vec<Value>) -> Result<String, String> {
+        let uuid = session::new_uuid();
+        let frame = json!({"type": "user", "uuid": uuid,
             "message": {"role": "user", "content": blocks}});
         self.send(&frame)?;
         if std::env::var_os("CLAUDE_SUB_DEBUG").is_some() {
             self.sent.push(frame);
         }
         self.running += 1;
-        Ok(())
+        Ok(uuid)
     }
 
     /// Write history frames on a cold session: every user frame but the
@@ -903,8 +939,9 @@ impl LiveSession {
         // claude queues it and attaches it at the tool boundary, so the
         // model's very next step sees it as a real user message.
         if front_parked && !user_blocks.is_empty() {
-            self.mid_frames.push(Value::Array(user_blocks.clone()));
-            self.send_user(std::mem::take(&mut user_blocks))?;
+            let key = replay_key(&Value::Array(user_blocks.clone()));
+            let uuid = self.send_user(std::mem::take(&mut user_blocks))?;
+            self.mid_frames.push((uuid, key));
         }
         // Any parked call the host produced no result for gets an error
         // answer — leaving it parked would block the front forever.
@@ -1033,8 +1070,7 @@ impl LiveSession {
                 }
             }
             Some("user") if v.get("isReplay").and_then(Value::as_bool) == Some(true) => {
-                let content = v.pointer("/message/content").unwrap_or(&Value::Null);
-                if let Some(k) = self.mid_frames.iter().position(|c| c == content) {
+                if let Some(k) = mid_frame_pos(&self.mid_frames, &v) {
                     self.mid_frames.remove(k);
                     if self.running > 1 {
                         // Consumed before the front's result: merged into
@@ -1339,6 +1375,18 @@ impl LiveSession {
 impl Drop for LiveSession {
     fn drop(&mut self) {
         self.close();
+        // Dropped while checked out: clear its busy marker so waiting
+        // takes stop waiting. `try_lock` keeps a hypothetical drop
+        // under the pool lock from deadlocking — the reap prune is the
+        // backstop for whatever this misses.
+        if let Some(pool) = POOL.get()
+            && let Ok(mut p) = pool.try_lock()
+            && p.busy.iter().any(|b| b.pid == self.pid)
+        {
+            p.busy.retain(|b| b.pid != self.pid);
+            drop(p);
+            POOL_CHANGED.notify_all();
+        }
     }
 }
 
@@ -1646,7 +1694,26 @@ fn classify(lines: &[Value]) -> Option<String> {
 /// three-tier cold start — stored resume point, synthetic transcript,
 /// stdin replay — where a refused resume (no request spent) advances the
 /// tier and anything else surfaces.
+/// Spawn + mark the session busy: its first turn drains checked out,
+/// and a follow-up that continues it waits for it to pool — an
+/// interrupted first turn finishes undelivered but still answers the
+/// next request warm. [`reap`]/[`give_back`]/[`LiveSession::drop`]
+/// clear the marker.
 fn spawn_conversation(
+    turn: &PreparedTurn,
+    tools: Vec<Value>,
+    effort: Option<&str>,
+    deadline: Instant,
+    home: Option<&Path>,
+) -> Result<(LiveSession, Term, Vec<Value>), String> {
+    let out = spawn_conversation_tiered(turn, tools, effort, deadline, home)?;
+    locked_pool()
+        .busy
+        .push(busy_entry(&out.0, turn.input.clone()));
+    Ok(out)
+}
+
+fn spawn_conversation_tiered(
     turn: &PreparedTurn,
     tools: Vec<Value>,
     effort: Option<&str>,
@@ -1786,6 +1853,38 @@ fn dump_debug(sent: &[Value], lines: &[Value], meta: &Value) {
     }
 }
 
+/// Identity of a user frame as claude replays it: claude re-encodes
+/// images (a 1920x1080 PNG comes back as a resized JPEG), so image blocks
+/// compare by position only and every other block compares exactly.
+fn replay_key(content: &Value) -> Value {
+    match content {
+        Value::Array(blocks) => Value::Array(
+            blocks
+                .iter()
+                .map(|b| match b.get("type").and_then(Value::as_str) {
+                    Some("image") => json!({"type": "image"}),
+                    _ => b.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Position of the mid-query frame an `isReplay` echo settles. The
+/// echoed `uuid` is authoritative — content is only a fallback for an
+/// echo without one, so a replayed lookalike can't settle the wrong
+/// frame.
+fn mid_frame_pos(frames: &[(String, Value)], echo: &Value) -> Option<usize> {
+    match echo.get("uuid").and_then(Value::as_str) {
+        Some(u) => frames.iter().position(|(uu, _)| uu.as_str() == u),
+        None => {
+            let content = replay_key(echo.pointer("/message/content").unwrap_or(&Value::Null));
+            frames.iter().position(|(_, key)| *key == content)
+        }
+    }
+}
+
 fn debug_on() -> bool {
     std::env::var_os("CLAUDE_SUB_DEBUG").is_some()
 }
@@ -1797,6 +1896,36 @@ fn debug_on() -> bool {
 /// starts. On a settled upstream rejection the session stays pooled
 /// (the host's identical retry continues it); only a dead wire kills it.
 pub fn run_turn(
+    body: &Value,
+    model: &str,
+    effort: Option<&str>,
+    timeout: Duration,
+    account_home: Option<&Path>,
+) -> Result<Vec<Value>, String> {
+    let first = run_turn_once(body, model, effort, timeout, account_home);
+    match &first {
+        // A 401 on a long-lived child usually means its in-memory OAuth
+        // state went stale: several children share one credential home and
+        // a sibling's refresh rotated the token out from under it. The
+        // failing session was closed, not pooled, so this retry cold-starts
+        // a fresh `claude`, which re-reads the credential file on disk.
+        // A second 401 is a genuinely dead login and goes through as-is.
+        Err(e) if is_auth_401(e) => {
+            if debug_on() {
+                eprintln!("claude-sub: 401 on a live child; retrying once on a fresh child");
+            }
+            std::thread::sleep(Duration::from_secs(2));
+            run_turn_once(body, model, effort, timeout, account_home)
+        }
+        _ => first,
+    }
+}
+
+fn is_auth_401(e: &str) -> bool {
+    chat::api_error(e).is_some_and(|(c, _)| c == 401)
+}
+
+fn run_turn_once(
     body: &Value,
     model: &str,
     effort: Option<&str>,
@@ -1879,7 +2008,9 @@ pub fn run_turn(
                     spawn_conversation(&turn, tools, effort, deadline, home.as_deref())?;
                 return finish_spawn(s2, t2, l2, &turn, "fresh:rewarm_dead");
             }
-            if s.settle(&e) {
+            if is_auth_401(&e) {
+                s.close();
+            } else if s.settle(&e) {
                 give_back(s);
             }
             return Err(e);
@@ -1902,6 +2033,10 @@ pub fn run_turn(
         // Settled upstream state: keep the session with the absorb state
         // that matched this turn, so an identical retry re-prompts the
         // same delta.
+        if is_auth_401(&e) {
+            s.close();
+            return Err(e);
+        }
         if chat::api_error(&e).is_some_and(|(c, _)| c == 429) {
             s.rate_limited = true;
         }
@@ -1934,7 +2069,7 @@ fn finish_spawn(
     match term {
         Term::Done => {
             if let Err(e) = chat::judge(&lines, true) {
-                if dead_wire(&e) {
+                if dead_wire(&e) || is_auth_401(&e) {
                     s.close();
                 } else {
                     // Settled upstream failure on a fresh child: the input
@@ -1975,6 +2110,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn replay_key_matches_a_reencoded_image_frame() {
+        let sent = json!([
+            {"type": "text", "text": "Shown: /tmp/s3.png"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+        ]);
+        let replayed = json!([
+            {"type": "text", "text": "Shown: /tmp/s3.png"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4"}}
+        ]);
+        assert_eq!(replay_key(&sent), replay_key(&replayed));
+        let other = json!([{"type": "text", "text": "different"}, replayed[1].clone()]);
+        assert_ne!(replay_key(&sent), replay_key(&other));
+    }
+
+    #[test]
+    fn mid_frame_pos_prefers_the_echoed_uuid() {
+        let text = json!([{"type": "text", "text": "same"}]);
+        let frames = vec![
+            ("u1".to_string(), replay_key(&text)),
+            ("u2".to_string(), replay_key(&text)),
+        ];
+        // Identical contents disambiguate by uuid alone.
+        let echo = json!({"type": "user", "isReplay": true, "uuid": "u2",
+            "message": {"content": text}});
+        assert_eq!(mid_frame_pos(&frames, &echo), Some(1));
+        // An unknown uuid settles nothing even when content matches.
+        let echo = json!({"uuid": "u3", "message": {"content": text}});
+        assert_eq!(mid_frame_pos(&frames, &echo), None);
+        // No uuid at all: content is the fallback.
+        let echo = json!({"message": {"content": text}});
+        assert_eq!(mid_frame_pos(&frames, &echo), Some(0));
+    }
 
     fn ids(v: &[&str]) -> HashSet<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -2061,6 +2230,22 @@ mod tests {
     fn assistant_msg(text: &str) -> Value {
         json!({"type": "message", "role": "assistant",
             "content": [{"type": "output_text", "text": text}]})
+    }
+
+    #[test]
+    fn could_continue_needs_the_absorbed_prefix() {
+        let absorbed = vec![user_msg("hi"), assistant_msg("a")];
+        // A follow-up extends it.
+        let mut next = absorbed.clone();
+        next.push(user_msg("and?"));
+        assert!(could_continue(&absorbed, &next));
+        // The identical retry does too.
+        assert!(could_continue(&absorbed, &absorbed));
+        // A forked or different conversation doesn't.
+        assert!(!could_continue(&absorbed, &[user_msg("other")]));
+        assert!(!could_continue(&absorbed, &absorbed[..1]));
+        // An empty absorbed prefix never blocks a wait.
+        assert!(could_continue(&[], &next));
     }
 
     #[test]
