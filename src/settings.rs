@@ -1,13 +1,14 @@
 //! The host-tool allowlist the `gray` MCP server advertises upstream.
 //!
-//! Default is bash-only: a harness may carry far more (search, discord,
-//! device tools, …) but a Claude turn sees — and may call — only `bash`.
+//! Default is every function tool the host sends, the same surface any
+//! other provider gets (the host's consent layer still gates each call).
+//! `/claude tools bash` narrows a Claude turn to `bash` alone.
 //! `/claude tools …` in the REPL (the sidecar's `command/run`) and
 //! `claude-sub tools …` in a shell are the same operation on the same
 //! file, `<gray home>/claude-sub/tools.json`. `chat::prepare_turn`
 //! re-reads it on every request, so a mid-session toggle applies to the
 //! next turn with no respawn, and the file is safe to hand-edit —
-//! missing or corrupt reads fail closed to bash.
+//! missing or corrupt reads fall back to the default.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -29,10 +30,10 @@ pub struct ToolPolicy {
 }
 
 impl Default for ToolPolicy {
-    /// Missing/corrupt file lands here: bash only.
+    /// Missing/corrupt file lands here: every host tool.
     fn default() -> Self {
         Self {
-            allow: BTreeSet::from([BASH.to_string()]),
+            allow: BTreeSet::from([ALL.to_string()]),
         }
     }
 }
@@ -57,7 +58,7 @@ impl ToolPolicy {
             .any(|p| p.len() > 1 && p.ends_with('*') && name.starts_with(&p[..p.len() - 1]))
     }
 
-    /// The persisted policy, or the bash-only default. Never errors: a
+    /// The persisted policy, or the all-tools default. Never errors: a
     /// turn must never fail on a settings read.
     pub fn load() -> Self {
         let Some(path) = file_path() else {
@@ -127,7 +128,7 @@ fn valid_entry(name: &str) -> bool {
         || valid_name(name)
         || name
             .strip_suffix('*')
-            .is_some_and(|prefix| valid_name(prefix))
+            .is_some_and(valid_name)
 }
 
 /// The `/claude` command body: `tools` runs the policy command, anything
@@ -146,8 +147,8 @@ const USAGE: &str = "\
 /claude — switch the session to Claude (connect → model picker).
 /claude tools — which harness tools the upstream Claude model may call.
   /claude tools          show the current policy
-  /claude tools all      allow every harness tool the host sends
-  /claude tools bash     bash only (the default)
+  /claude tools all      allow every harness tool the host sends (the default)
+  /claude tools bash     bash only
   /claude tools +name    also allow one tool, e.g. /claude tools +discord_send
   /claude tools +mcp__*  allow every MCP server tool (any `prefix*` works)
   /claude tools -name    remove one
@@ -231,6 +232,14 @@ mod pattern_tests {
         assert!(!p.allows("discord_send"));
         assert!(p.allows_by_pattern_only("mcp__treg__balance"));
         assert!(!p.allows_by_pattern_only("bash"));
+    }
+
+    #[test]
+    fn default_admits_plugin_tools() {
+        let p = ToolPolicy::default();
+        assert!(p.allows("bash"));
+        assert!(p.allows("memory"));
+        assert!(p.allows("discord_send"));
     }
 
     #[test]
