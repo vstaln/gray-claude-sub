@@ -166,13 +166,16 @@ fn handle_conn(
             // Terminal auth verdicts stay HTTP: the host maps 401/403
             // straight to an auth error — no retry is coming, so the
             // message lands as-is.
-            // A 400 (model refused for this plan, malformed request) is just
-            // as final: streamed, the host would retry it into its budget.
-            if let Some((code @ (400 | 401 | 403), msg)) = crate::chat::api_error(&detail) {
-                let kind = if code == 400 {
-                    "invalid_request_error"
-                } else {
+            // A 400 (model refused for this plan, malformed request) or 404
+            // (no such model) is just as final: streamed, the host would
+            // retry it into its budget.
+            if let Some((code, msg)) =
+                crate::chat::api_error(&detail).filter(|(c, _)| terminal_status(*c))
+            {
+                let kind = if matches!(code, 401 | 403) {
                     "authentication_error"
+                } else {
+                    "invalid_request_error"
                 };
                 let body = json!({"type": "error", "error": {
                     "type": kind, "message": msg}});
@@ -365,6 +368,12 @@ fn write_sse_failure(s: &mut std::net::TcpStream, detail: &str) {
         .and_then(|_| s.flush());
 }
 
+/// Upstream verdicts no retry can change: answered as real HTTP statuses so
+/// the host classifies them terminal instead of stream-retrying them.
+fn terminal_status(code: u16) -> bool {
+    matches!(code, 400 | 401 | 403 | 404)
+}
+
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let reason = match status {
         400 => "Bad Request",
@@ -383,7 +392,6 @@ fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let _ = s.write_all(body);
     let _ = s.flush();
 }
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -397,5 +405,28 @@ mod tests {
                      X-Gray-Isolated: 1";
         // A header-looking line in the body is not a header.
         assert!(!super::parse_head(plain).isolated);
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::terminal_status;
+
+    #[test]
+    fn final_verdicts_are_terminal_and_throttles_are_not() {
+        for c in [400, 401, 403, 404] {
+            assert!(terminal_status(c), "{c}");
+        }
+        for c in [408, 429, 500, 502, 503, 529] {
+            assert!(!terminal_status(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_missing_model_is_a_terminal_404() {
+        let detail = "native API error 404: There's an issue with the selected model (x).";
+        let (code, _) = crate::chat::api_error(detail).unwrap();
+        assert_eq!(code, 404);
+        assert!(terminal_status(code));
     }
 }
