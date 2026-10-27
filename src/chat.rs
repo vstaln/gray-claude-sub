@@ -377,7 +377,10 @@ fn hoist_tool_results(frames: &mut [Value]) {
         if f.get("type").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        let Some(arr) = f.pointer_mut("/message/content").and_then(Value::as_array_mut) else {
+        let Some(arr) = f
+            .pointer_mut("/message/content")
+            .and_then(Value::as_array_mut)
+        else {
             continue;
         };
         let Some(last_result) = arr.iter().rposition(is_result) else {
