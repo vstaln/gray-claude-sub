@@ -124,11 +124,7 @@ fn valid_name(name: &str) -> bool {
 
 /// A policy entry: a tool name, `*`, or a `prefix*` pattern.
 fn valid_entry(name: &str) -> bool {
-    name == ALL
-        || valid_name(name)
-        || name
-            .strip_suffix('*')
-            .is_some_and(valid_name)
+    name == ALL || valid_name(name) || name.strip_suffix('*').is_some_and(valid_name)
 }
 
 /// The `/claude` command body: `tools` runs the policy command, anything

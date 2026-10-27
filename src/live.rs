@@ -1707,7 +1707,9 @@ fn spawn_conversation(
     home: Option<&Path>,
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
     let out = spawn_conversation_tiered(turn, tools, effort, deadline, home)?;
-    locked_pool().busy.push(busy_entry(&out.0, turn.input.clone()));
+    locked_pool()
+        .busy
+        .push(busy_entry(&out.0, turn.input.clone()));
     Ok(out)
 }
 
