@@ -1921,6 +1921,87 @@ pub fn run_turn(
     }
 }
 
+/// Answer a host side request (`x-gray-isolated`: a compaction summary) on
+/// a throwaway child. It shares the conversation's history but is NOT its
+/// next turn, so it must never reach the pool or the stored resume point:
+/// continuing the live child would queue the summary prompt into the
+/// running conversation and supersede the tool calls parked in it, and
+/// the stored point would `--resume` the conversation's own transcript in
+/// a second process. History loads from a fresh synthetic transcript
+/// (stdin replay as fallback); the child and its transcript are discarded
+/// after the one answer.
+pub fn run_isolated(
+    body: &Value,
+    model: &str,
+    effort: Option<&str>,
+    timeout: Duration,
+    account_home: Option<&Path>,
+) -> Result<Vec<Value>, String> {
+    if let Some(key) = setup::conflicting_env() {
+        return Err(format!(
+            "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
+        ));
+    }
+    let turn = chat::prepare_turn(body, model)?;
+    let tools = tool_inventory(
+        &turn.names,
+        body.get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .as_slice(),
+    );
+    let home = session::claude_home(account_home);
+    let home = home.as_deref();
+    let deadline = Instant::now() + timeout;
+    let split = isolated_split(&turn.frames);
+    let synthetic = (split > 0)
+        .then(|| session::synthesize(&turn.frames[..split], home))
+        .flatten();
+    let mut throwaway: Vec<String> = Vec::new();
+    let mut attempt = |resume: Option<&ResumePoint>, tail: &[Value]| {
+        let r = spawn_live_retried(&turn, tools.clone(), effort, resume, tail, deadline, home);
+        if let Ok((s, _, _)) = &r {
+            throwaway.push(s.sid.clone());
+        }
+        r
+    };
+    let mut result = match &synthetic {
+        Some(at) => attempt(Some(at), &turn.frames[split..]),
+        None => attempt(None, &turn.frames),
+    };
+    if synthetic.is_some()
+        && let Ok((s, Term::Done, lines)) = &mut result
+        && chat::judge(lines, true)
+            .err()
+            .is_some_and(|e| chat::replay_after_failed_resume(&e))
+    {
+        s.close();
+        result = attempt(None, &turn.frames);
+    }
+    let outcome = result.map(|(mut s, term, lines)| {
+        s.close();
+        (term, lines)
+    });
+    for sid in synthetic.iter().map(|(sid, _)| sid).chain(throwaway.iter()) {
+        session::discard(sid, home);
+    }
+    let (term, lines) = outcome?;
+    if matches!(term, Term::Done) {
+        chat::judge(&lines, true)?;
+    }
+    Ok(lines)
+}
+
+/// Where a side request's history ends and its own tail begins: after the
+/// last assistant frame (the same cut a cold start uses).
+fn isolated_split(frames: &[Value]) -> usize {
+    frames
+        .iter()
+        .rposition(|f| f.get("type").and_then(Value::as_str) == Some("assistant"))
+        .map_or(0, |i| i + 1)
+}
+
 fn is_auth_401(e: &str) -> bool {
     chat::api_error(e).is_some_and(|(c, _)| c == 401)
 }
@@ -2110,6 +2191,35 @@ mod tests {
     }
 
     use super::*;
+
+    /// Why side requests need their own path: a host compaction summary is
+    /// the absorbed history plus one user prompt, sent while the turn's
+    /// tool calls are still parked in the child. By content it is exactly
+    /// an "undelivered reply, user typed again" continuation — the live
+    /// child would take it, queue the prompt into the conversation and
+    /// supersede the parked calls. Only the host's x-gray-isolated mark
+    /// tells the two apart.
+    #[test]
+    fn summary_request_looks_like_a_continuation() {
+        let absorbed = vec![json!({"type": "message", "role": "user", "content": "go"})];
+        let mut summary = absorbed.clone();
+        summary.push(
+            json!({"type": "message", "role": "user", "content": "Summarize the conversation"}),
+        );
+        let (tail, undelivered) =
+            continuation(&absorbed, &["c1".to_string()], "", &summary).expect("continues");
+        assert_eq!(tail.len(), 1);
+        assert!(undelivered);
+    }
+
+    #[test]
+    fn isolated_split_cuts_after_the_last_assistant_frame() {
+        let u = json!({"type": "user"});
+        let a = json!({"type": "assistant"});
+        assert_eq!(isolated_split(&[u.clone(), a.clone(), u.clone()]), 2);
+        assert_eq!(isolated_split(std::slice::from_ref(&u)), 0);
+        assert_eq!(isolated_split(&[u.clone(), a.clone()]), 2);
+    }
 
     #[test]
     fn replay_key_matches_a_reencoded_image_frame() {
