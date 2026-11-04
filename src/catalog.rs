@@ -32,11 +32,6 @@ pub struct ModelInfo {
     /// effort for it, so the host shows no effort selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub efforts: Vec<String>,
-    /// Prompt tokens above which this model bills a higher price tier, from
-    /// the pricing page's `(for prompts over N tokens)` rows. `None` = the
-    /// provider declares no cliff.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price_cliff: Option<u32>,
 }
 
 /// A resolved view of the catalog: parsed, cached or empty. `models` keeps the
@@ -240,17 +235,6 @@ pub fn context_window_in(model: &str, s: &Snapshot) -> Option<u32> {
 
 pub fn context_window(model: &str) -> Option<u32> {
     context_window_in(model, &current())
-}
-
-/// The declared price cliff for a route, resolved through canonical ids like
-/// [`context_window_in`]. `None` when the provider declares none — no
-/// default: the host must never guess a cliff.
-pub fn price_cliff_in(model: &str, s: &Snapshot) -> Option<u32> {
-    s.by_id(canonical_in(model, s)).and_then(|m| m.price_cliff)
-}
-
-pub fn price_cliff(model: &str) -> Option<u32> {
-    price_cliff_in(model, &current())
 }
 
 /// The effort tiers a route offers, resolved through canonical ids like
