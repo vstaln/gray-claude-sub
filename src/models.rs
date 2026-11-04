@@ -46,9 +46,9 @@ pub fn catalog_from(s: &Snapshot) -> ProviderModelCatalog {
         .map(|id| ProviderModel {
             name: catalog::display_name_in(&id, s),
             context_window: catalog::context_window_in(&id, s),
-            // The pricing page's `(for prompts over N tokens)` row for this
-            // model, when it has one; the host compacts under that cliff.
-            price_cliff_tokens: catalog::price_cliff_in(&id, s),
+            // Subscription usage isn't billed per token, so API price tiers
+            // (long-prompt surcharges) are no reason to compact early.
+            price_cliff_tokens: None,
             // The tiers the page's `Default effort` cell earns this model. An
             // empty list is "no reasoning control" to the host, so it is only
             // ever empty for a model the page says nothing about.
@@ -124,7 +124,6 @@ pub fn parse_overview(page: &str) -> Result<Vec<ModelInfo>, String> {
             id,
             window,
             efforts,
-            price_cliff: None,
         })
         .collect();
     for id in legacy_ids(page) {
@@ -133,7 +132,6 @@ pub fn parse_overview(page: &str) -> Result<Vec<ModelInfo>, String> {
                 id,
                 window: None,
                 efforts: Vec::new(),
-                price_cliff: None,
             });
         }
     }
@@ -327,19 +325,8 @@ fn legacy_ids(page: &str) -> Vec<String> {
 /// request carries no credentials, so no secret can reach an error string.
 pub async fn fetch_snapshot() -> Result<Arc<Snapshot>, String> {
     let url = models_url(std::env::var(MODELS_URL_ENV).ok().as_deref());
-    let pricing_url = crate::pricing::pricing_url(
-        std::env::var(crate::pricing::PRICING_URL_ENV)
-            .ok()
-            .as_deref(),
-    );
-    // One round trip, two pages: pricing failures never stall the model list.
-    let (page, pricing) = tokio::join!(
-        fetch_page(&url, "models page"),
-        crate::pricing::fetch_pricing(&pricing_url),
-    );
-    let mut models = parse_overview(&page?)?;
-    crate::pricing::annotate(&mut models, pricing.ok().as_deref(), &catalog::current());
-    Ok(Arc::new(Snapshot::new(models)))
+    let page = fetch_page(&url, "models page").await?;
+    Ok(Arc::new(Snapshot::new(parse_overview(&page)?)))
 }
 
 #[path = "models_tests.rs"]

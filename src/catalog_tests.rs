@@ -5,7 +5,6 @@ fn model(id: &str, window: u32) -> ModelInfo {
         id: id.to_string(),
         window: Some(window),
         efforts: Vec::new(),
-        price_cliff: None,
     }
 }
 
@@ -179,13 +178,11 @@ fn cache_roundtrip_keeps_every_field_and_order() {
             id: "claude-sonnet-5-5".into(),
             window: Some(1_000_000),
             efforts: vec!["low".into(), "high".into()],
-            price_cliff: None,
         },
         ModelInfo {
             id: "claude-haiku-9-9".into(),
             window: None,
             efforts: Vec::new(),
-            price_cliff: Some(100_000),
         },
     ];
     write_cache_at(&path, &models).unwrap();
