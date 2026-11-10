@@ -197,13 +197,11 @@ fn catalog_lists_routes_with_windows_and_their_efforts() {
             id: "claude-sonnet-9-9".into(),
             window: Some(1_000_000),
             efforts: EFFORTS.iter().map(|e| e.to_string()).collect(),
-            price_cliff: None,
         },
         ModelInfo {
             id: "claude-haiku-9-9".into(),
             window: Some(200_000),
             efforts: Vec::new(),
-            price_cliff: Some(100_000),
         },
     ]);
     let got = catalog_from(&s);

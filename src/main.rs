@@ -52,7 +52,7 @@ type Relays = relay::Intents;
 fn cli_help() -> String {
     "claude-sub — Claude Pro/Max subscription provider for gray\n\
      usage: claude-sub manifest | sidecar | tools [all|bash|+name|-name|name …]\n\
-              | account [add|list|use|remove|status] …\n\
+              | account [add|list|use|remove|status|strategy] …\n\
      slash:  /claude · /claude tools … · /claude account …"
         .to_string()
 }

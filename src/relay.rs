@@ -93,25 +93,12 @@ fn handle_conn(
             return;
         }
     }
-    let head_str = String::from_utf8_lossy(&head).into_owned();
-    let mut lines = head_str.lines();
-    let request_line = lines.next().unwrap_or("").to_string();
-    let mut len = 0usize;
-    let mut auth = String::new();
-    for line in lines {
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        let Some((name, v)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("content-length") {
-            len = v.trim().parse().unwrap_or(0);
-        } else if name.eq_ignore_ascii_case("authorization") {
-            auth = v.trim().to_string();
-        }
-    }
+    let Head {
+        request_line,
+        len,
+        auth,
+        isolated,
+    } = parse_head(&String::from_utf8_lossy(&head));
     let header_end = head
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -162,7 +149,7 @@ fn handle_conn(
         let intents = intents.clone();
         let bearer = bearer.to_string();
         std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&intents, &bearer, &body));
+            let _ = tx.send(run_turn(&intents, &bearer, &body, isolated));
         });
     }
     match rx.recv_timeout(HEADER_GRACE) {
@@ -179,9 +166,19 @@ fn handle_conn(
             // Terminal auth verdicts stay HTTP: the host maps 401/403
             // straight to an auth error — no retry is coming, so the
             // message lands as-is.
-            if let Some((code @ (401 | 403), msg)) = crate::chat::api_error(&detail) {
+            // A 400 (model refused for this plan, malformed request) or 404
+            // (no such model) is just as final: streamed, the host would
+            // retry it into its budget.
+            if let Some((code, msg)) =
+                crate::chat::api_error(&detail).filter(|(c, _)| terminal_status(*c))
+            {
+                let kind = if matches!(code, 401 | 403) {
+                    "authentication_error"
+                } else {
+                    "invalid_request_error"
+                };
                 let body = json!({"type": "error", "error": {
-                    "type": "authentication_error", "message": msg}});
+                    "type": kind, "message": msg}});
                 write_resp(s, code, body.to_string().as_bytes());
                 return;
             }
@@ -229,7 +226,51 @@ fn handle_conn(
     }
 }
 
-fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
+/// The request line plus the headers the relay acts on.
+struct Head {
+    request_line: String,
+    len: usize,
+    auth: String,
+    isolated: bool,
+}
+
+fn parse_head(head: &str) -> Head {
+    let mut lines = head.lines();
+    let mut out = Head {
+        request_line: lines.next().unwrap_or("").to_string(),
+        len: 0,
+        auth: String::new(),
+        isolated: false,
+    };
+    for line in lines {
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, v)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            out.len = v.trim().parse().unwrap_or(0);
+        } else if name.eq_ignore_ascii_case("authorization") {
+            out.auth = v.trim().to_string();
+        } else if name.eq_ignore_ascii_case(ISOLATED_HEADER) {
+            out.isolated = v.trim() == "1";
+        }
+    }
+    out
+}
+
+/// The host marks side requests (its compaction summaries) with this
+/// header: they are not the conversation's next turn.
+const ISOLATED_HEADER: &str = "x-gray-isolated";
+
+fn run_turn(
+    intents: &Intents,
+    bearer: &str,
+    raw: &[u8],
+    isolated: bool,
+) -> Result<Vec<u8>, String> {
     let intent = intents
         .lock()
         .map(|mut m| m.remove(bearer))
@@ -249,7 +290,11 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
     // writes only its delta into the pooled child; tool calls park inside
     // the child's `gray` MCP server until a later turn answers them.
     let home = intent.account.as_ref().map(|p| p.home.as_path());
-    let result = crate::live::run_turn(&body, &intent.model, effort, crate::live::turn_cap(), home);
+    let result = if isolated {
+        crate::live::run_isolated(&body, &intent.model, effort, crate::live::turn_cap(), home)
+    } else {
+        crate::live::run_turn(&body, &intent.model, effort, crate::live::turn_cap(), home)
+    };
     // Account health rides the verdict: a served answer clears the slate,
     // an account-scoped upstream failure (401/429) benches the account,
     // request-scoped failures leave it alone.
@@ -323,6 +368,12 @@ fn write_sse_failure(s: &mut std::net::TcpStream, detail: &str) {
         .and_then(|_| s.flush());
 }
 
+/// Upstream verdicts no retry can change: answered as real HTTP statuses so
+/// the host classifies them terminal instead of stream-retrying them.
+fn terminal_status(code: u16) -> bool {
+    matches!(code, 400 | 401 | 403 | 404)
+}
+
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let reason = match status {
         400 => "Bad Request",
@@ -340,4 +391,42 @@ fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let _ = s.write_all(header.as_bytes());
     let _ = s.write_all(body);
     let _ = s.flush();
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn isolated_header_marks_side_requests() {
+        let head = "POST /relay/b/responses HTTP/1.1\r\nContent-Length: 12\r\n\
+                    Authorization: Bearer b\r\nX-Gray-Isolated: 1\r\n\r\n{}";
+        let h = super::parse_head(head);
+        assert!(h.isolated);
+        assert_eq!((h.len, h.auth.as_str()), (12, "Bearer b"));
+        let plain = "POST /relay/b/responses HTTP/1.1\r\nContent-Length: 2\r\n\r\n\
+                     X-Gray-Isolated: 1";
+        // A header-looking line in the body is not a header.
+        assert!(!super::parse_head(plain).isolated);
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::terminal_status;
+
+    #[test]
+    fn final_verdicts_are_terminal_and_throttles_are_not() {
+        for c in [400, 401, 403, 404] {
+            assert!(terminal_status(c), "{c}");
+        }
+        for c in [408, 429, 500, 502, 503, 529] {
+            assert!(!terminal_status(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_missing_model_is_a_terminal_404() {
+        let detail = "native API error 404: There's an issue with the selected model (x).";
+        let (code, _) = crate::chat::api_error(detail).unwrap();
+        assert_eq!(code, 404);
+        assert!(terminal_status(code));
+    }
 }

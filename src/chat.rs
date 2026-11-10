@@ -175,7 +175,15 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
             if !policy.allows(name) {
                 continue;
             }
-            check_tool_name(name, &seen_names)?;
+            // Wildcard-admitted tools (`mcp__*`, `all`) are best-effort: one
+            // overlong or duplicate name is dropped, it never fails the turn.
+            if let Err(e) = check_tool_name(name, &seen_names) {
+                if policy.allows_by_pattern_only(name) {
+                    eprintln!("claude-sub: skipping tool {name:?}: {e}");
+                    continue;
+                }
+                return Err(e);
+            }
             seen_names.insert(name.to_string());
             names.push(name.to_string());
             tool_index.insert(name.to_string(), format!("{TOOL_PREFIX}{name}"));
@@ -331,6 +339,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     // our own native messages replace the re-derived assistant frames when
     // the visible projection still matches (host compaction owns history).
     restore_carriers(&input, &mut frames, model);
+    hoist_tool_results(&mut frames);
     let Some(last) = frames.last() else {
         return Err("history must end in a nonempty user/tool-result message".into());
     };
@@ -352,6 +361,57 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         names,
         native_model: crate::catalog::native_model(model)?,
     })
+}
+
+/// The API wants every `tool_result` at the head of its user message: a
+/// block between two results makes it reject the later ones as missing
+/// ("tool_use ids were found without tool_result blocks immediately after",
+/// which native reports as "400 due to tool use concurrency issues"). The
+/// host follows each tool output with that tool's media, and once media is
+/// elided it arrives as a text stub, which the image fold above skips. So a
+/// block sandwiched between results folds into the result before it (it is
+/// that tool's attachment); any other stray block moves after the results.
+fn hoist_tool_results(frames: &mut [Value]) {
+    let is_result = |b: &Value| b.get("type").and_then(Value::as_str) == Some("tool_result");
+    for f in frames.iter_mut() {
+        if f.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(arr) = f
+            .pointer_mut("/message/content")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let Some(last_result) = arr.iter().rposition(is_result) else {
+            continue;
+        };
+        if arr[..last_result].iter().all(is_result) {
+            continue;
+        }
+        let mut results: Vec<Value> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for (i, b) in std::mem::take(arr).into_iter().enumerate() {
+            if is_result(&b) {
+                results.push(b);
+                continue;
+            }
+            if i < last_result
+                && let Some(tr) = results.last_mut()
+            {
+                if let Some(t) = tr["content"].as_str() {
+                    tr["content"] = json!([{"type": "text", "text": t}]);
+                }
+                if let Some(parts) = tr["content"].as_array_mut() {
+                    parts.push(b);
+                    continue;
+                }
+            }
+            rest.push(b);
+        }
+        results.extend(rest);
+        *arr = results;
+    }
 }
 
 fn restore_carriers(input: &[Value], frames: &mut [Value], model: &str) {
@@ -636,6 +696,17 @@ pub(crate) fn rate_limit_rejection(v: &Value) -> Option<String> {
     if info.get("status").and_then(Value::as_str) != Some("rejected") {
         return None;
     }
+    // Model gated behind paid usage credits (e.g. Fable on Pro): not a
+    // quota window — nothing resets, so a "usage limit · resets in …"
+    // sentence would be wrong, and hosts that treat quota as an auth
+    // failure would tell the user their login is broken. Report it as a
+    // request-scoped model refusal: no account cooldown, no retry.
+    if info.get("errorCode").and_then(Value::as_str) == Some("credits_required") {
+        return Some(format!(
+            "{API_ERROR}400: model not supported on this Claude plan: it requires usage \
+             credits (claude.ai/settings/usage). Switch model with /models."
+        ));
+    }
     let kind = info
         .get("rateLimitType")
         .and_then(Value::as_str)
@@ -901,7 +972,8 @@ pub fn fold_lines(
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
         "input_tokens_details": {"cached_tokens": usage.cached_tokens,
-            "cache_creation_tokens": usage.cache_write_tokens}});
+            "cache_creation_tokens": usage.cache_write_tokens},
+        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens}});
     emit(
         &mut sse,
         &json!({"type": "response.completed",
@@ -920,6 +992,8 @@ pub struct Usage {
     pub cached_tokens: usize,
     /// `cache_creation_input_tokens` — a subset of `input_tokens`.
     pub cache_write_tokens: usize,
+    /// `output_tokens_details.thinking_tokens` — a subset of `output_tokens`.
+    pub reasoning_tokens: usize,
 }
 
 /// `result` usage is the settled query's truth where assistant snapshots
@@ -948,6 +1022,7 @@ fn map_result_usage(u: &Value, last_request: Option<&Usage>) -> Usage {
             output_tokens: top.output_tokens,
             cached_tokens: req.cached_tokens,
             cache_write_tokens: req.cache_write_tokens,
+            reasoning_tokens: top.reasoning_tokens,
         },
         None => top,
     }
@@ -964,11 +1039,16 @@ pub fn map_usage(u: &Value) -> Usage {
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
+    let thinking = u
+        .pointer("/output_tokens_details/thinking_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
     Usage {
         input_tokens: input.saturating_add(read).saturating_add(write),
         output_tokens: output,
         cached_tokens: read,
         cache_write_tokens: write,
+        reasoning_tokens: thinking,
     }
 }
 

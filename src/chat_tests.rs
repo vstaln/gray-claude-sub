@@ -113,6 +113,28 @@ fn usage_reports_cache_reads_and_writes() {
 }
 
 #[test]
+fn usage_reports_thinking_tokens() {
+    // Anthropic counts thinking inside output_tokens and breaks it out at
+    // output_tokens_details.thinking_tokens — forward it as
+    // reasoning_tokens or the host gauge under-reports the turn.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 2, "output_tokens": 9,
+                "output_tokens_details": {"thinking_tokens": 5}}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 4, "output_tokens": 12,
+                "output_tokens_details": {"thinking_tokens": 8}}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (sse, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.output_tokens, 12);
+    assert_eq!(usage.reasoning_tokens, 8);
+    let s = String::from_utf8(sse).unwrap();
+    assert!(s.contains("\"reasoning_tokens\":8"), "{s}");
+}
+
+#[test]
 fn parked_turn_reports_assistant_usage() {
     // A turn that ends on parked tool calls returns no `result` line —
     // the query is still open. Usage must come from `message.usage` on
@@ -329,6 +351,32 @@ fn input_images_become_native_image_blocks() {
         json!({"type": "text", "text": "Shown: x.png"})
     );
     assert_eq!(tr["content"][1]["source"]["data"], "BBB");
+}
+
+#[test]
+fn parallel_results_with_elided_media_stay_at_message_head() {
+    // Two parallel views whose images were elided to text stubs: each stub
+    // follows its own output, so it sat between the results (a 400 natively).
+    let stub = |n: &str| json!({"role": "user", "content": [{"type": "input_text", "text": format!("[image/png elided {n}]")}]});
+    let b = body(vec![
+        json!({"role": "user", "content": "look"}),
+        json!({"type": "function_call", "call_id": "c1", "name": "view", "arguments": "{}"}),
+        json!({"type": "function_call", "call_id": "c2", "name": "view", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "c1", "output": "Shown: a.png"}),
+        stub("a"),
+        json!({"type": "function_call_output", "call_id": "c2", "output": "Shown: b.png"}),
+        stub("b"),
+        json!({"role": "user", "content": "go on"}),
+    ]);
+    let turn = prepare_turn(&b, "sonnet").unwrap();
+    let last = turn.frames[2]["message"]["content"].as_array().unwrap();
+    let kinds: Vec<&str> = last.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["tool_result", "tool_result", "text", "text"]);
+    // The sandwiched stub folds into its own call's result.
+    assert_eq!(last[0]["tool_use_id"], "c1");
+    assert_eq!(last[0]["content"][1]["text"], "[image/png elided a]");
+    assert_eq!(last[1]["tool_use_id"], "c2");
+    assert_eq!(last[1]["content"], "Shown: b.png");
 }
 
 #[test]

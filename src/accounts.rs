@@ -27,7 +27,7 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// 401 TTL: a dead login, retried occasionally in case it healed.
 const COOL_401: u64 = 5 * 60;
@@ -469,21 +469,96 @@ claude-sub account — multiple Claude logins behind one provider.
   claude-sub account list                          accounts + health
   claude-sub account use <label>                   pin an account (use --clear to unpin)
   claude-sub account remove [--keep] <label>       drop an account (+its managed home)
+  claude-sub account strategy <fill_first|least_used>
+                                                  pick order among usable accounts
   claude-sub account status                        which account serves now
+  any verb accepts --json for the machine contract the host /accounts panel reads
 The file is <gray home>/claude-sub/accounts.json; absent or empty
 `accounts` keeps the single ambient `claude` login.";
 
 /// `claude-sub account …` (interactive: a real terminal) and `/claude
 /// account …` (inside the sidecar — `add` can't drive OAuth there).
+///
+/// `--json` anywhere in the args switches every verb to the machine
+/// contract the host `/accounts` panel reads: `list`/`status` print the
+/// pool document, mutations print `{"ok":true,…}` (errors still exit 2
+/// with the message on stderr).
 pub fn command(args: &[String], interactive: bool) -> Result<String, String> {
+    let json = args.iter().any(|a| a == "--json");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--json")
+        .cloned()
+        .collect();
     match args.first().map(String::as_str) {
-        Some("add") => cmd_add(&args[1..], interactive),
-        Some("use") => cmd_use(&args[1..]),
-        Some("remove") | Some("rm") => cmd_remove(&args[1..]),
-        Some("status") => cmd_status(),
-        Some("list") | None => cmd_list(),
+        Some("add") => cmd_add(&args[1..], interactive, json),
+        Some("use") => cmd_use(&args[1..], json),
+        Some("remove") | Some("rm") => cmd_remove(&args[1..], json),
+        Some("strategy") => cmd_strategy(&args[1..], json),
+        Some("status") => cmd_status(json),
+        Some("list") | None => cmd_list(json),
         Some(other) => Err(format!("unknown account verb {other:?}\n\n{USAGE}")),
     }
+}
+
+/// The machine-readable pool document. `ambient` is true when no pool is
+/// configured and the ambient `claude` login serves; `serving.kind` is
+/// `account`, `ambient`, `cooldown` (every account benched — `reason`
+/// names the earliest reset) or `none`.
+fn store_json(store: &Store) -> Result<String, String> {
+    let now = now_secs();
+    let accounts: Vec<Value> = store
+        .accounts
+        .iter()
+        .map(|a| {
+            json!({
+                "label": a.label,
+                "home": a.home.display().to_string(),
+                "email": a.email,
+                "org": a.org,
+                "added_at": a.added_at,
+                "cooldown_until": a.cooldown_until,
+                "cooling": cooled(a, now),
+                "last_error": a.last_error,
+                "request_count": a.request_count,
+                "last_used_at": a.last_used_at,
+                "pinned": store.selected.as_deref() == Some(a.label.as_str()),
+            })
+        })
+        .collect();
+    let serving = match pick_from(store) {
+        Ok(Some(p)) => json!({"kind": "account", "label": p.label}),
+        Ok(None) if store.accounts.is_empty() => json!({"kind": "ambient"}),
+        Ok(None) => json!({"kind": "none"}),
+        Err(e) => {
+            let until = store
+                .accounts
+                .iter()
+                .map(|a| a.cooldown_until)
+                .filter(|u| *u > now)
+                .min()
+                .unwrap_or(0);
+            json!({"kind": "cooldown", "until": until, "reason": e})
+        }
+    };
+    serde_json::to_string_pretty(&json!({
+        "version": 1,
+        "plugin": crate::manifest::PLUGIN_NAME,
+        "provider": crate::manifest::PROVIDER_ID,
+        "strategy": if store.strategy.is_empty() { "fill_first" } else { &store.strategy },
+        "selected": store.selected,
+        "ambient": store.accounts.is_empty(),
+        "accounts": accounts,
+        "serving": serving,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// `{"ok":true,…}` for the mutating verbs under `--json`.
+fn ok_json(extra: Value) -> Result<String, String> {
+    let mut v = extra;
+    v["ok"] = json!(true);
+    serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
 fn valid_label(label: &str) -> Result<(), String> {
@@ -500,7 +575,7 @@ fn valid_label(label: &str) -> Result<(), String> {
         .ok_or_else(|| format!("bad label {label:?}: 1-40 chars of [A-Za-z0-9_-]"))
 }
 
-fn cmd_add(args: &[String], interactive: bool) -> Result<String, String> {
+fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, String> {
     let mut home: Option<PathBuf> = None;
     let mut label: Option<String> = None;
     let mut it = args.iter();
@@ -618,22 +693,36 @@ fn cmd_add(args: &[String], interactive: bool) -> Result<String, String> {
         .last()
         .and_then(|a| a.email.clone())
         .unwrap_or_else(|| "identity pending".to_string());
+    if json {
+        return ok_json(json!({
+            "message": format!("account {label:?} added"),
+            "label": label,
+            "email": who,
+            "selected": store.selected,
+        }));
+    }
     Ok(format!(
         "account {label:?} added ({who}); home {}",
         home.display()
     ))
 }
 
-fn cmd_use(args: &[String]) -> Result<String, String> {
+fn cmd_use(args: &[String], json: bool) -> Result<String, String> {
     let mut store = load();
     match args.first().map(String::as_str) {
         None => {
             let sel = store.selected.as_deref().unwrap_or("(none)");
+            if json {
+                return ok_json(json!({"selected": store.selected}));
+            }
             Ok(format!("pinned account: {sel}"))
         }
         Some("--clear") | Some("none") | Some("auto") => {
             store.selected = None;
             save(&store)?;
+            if json {
+                return ok_json(json!({"selected": store.selected}));
+            }
             Ok("pin cleared — selection follows the strategy".to_string())
         }
         Some(label) => {
@@ -642,12 +731,45 @@ fn cmd_use(args: &[String]) -> Result<String, String> {
             }
             store.selected = Some(label.to_string());
             save(&store)?;
+            if json {
+                return ok_json(json!({"selected": store.selected}));
+            }
             Ok(format!("serving account: {label}"))
         }
     }
 }
 
-fn cmd_remove(args: &[String]) -> Result<String, String> {
+/// `account strategy fill_first|least_used` — bare prints the current
+/// strategy. Selection among non-cooled accounts only; the pin still wins.
+fn cmd_strategy(args: &[String], json: bool) -> Result<String, String> {
+    let mut store = load();
+    match args.first().map(String::as_str) {
+        None => {
+            let cur = if store.strategy.is_empty() {
+                "fill_first"
+            } else {
+                &store.strategy
+            };
+            if json {
+                return ok_json(json!({"strategy": cur}));
+            }
+            Ok(format!("strategy: {cur}"))
+        }
+        Some("fill_first") | Some("least_used") => {
+            store.strategy = args[0].clone();
+            save(&store)?;
+            if json {
+                return ok_json(json!({"strategy": store.strategy}));
+            }
+            Ok(format!("strategy: {}", store.strategy))
+        }
+        Some(other) => Err(format!(
+            "unknown strategy {other:?} — fill_first or least_used"
+        )),
+    }
+}
+
+fn cmd_remove(args: &[String], json: bool) -> Result<String, String> {
     let mut keep = false;
     let mut label: Option<String> = None;
     for a in args {
@@ -681,6 +803,9 @@ fn cmd_remove(args: &[String]) -> Result<String, String> {
             .map_err(|e| format!("removed {label:?} but not {}: {e}", acc.home.display()))?;
         msg.push_str(&format!(" and its credential home {}", acc.home.display()));
     }
+    if json {
+        return ok_json(json!({"message": msg}));
+    }
     Ok(msg)
 }
 
@@ -708,8 +833,11 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
     )
 }
 
-fn cmd_list() -> Result<String, String> {
+fn cmd_list(json: bool) -> Result<String, String> {
     let store = load();
+    if json {
+        return store_json(&store);
+    }
     if store.accounts.is_empty() {
         return Ok("no accounts configured — turns use the ambient `claude` login".to_string());
     }
@@ -723,8 +851,11 @@ fn cmd_list() -> Result<String, String> {
     Ok(out)
 }
 
-fn cmd_status() -> Result<String, String> {
+fn cmd_status(json: bool) -> Result<String, String> {
     let store = load();
+    if json {
+        return store_json(&store);
+    }
     if store.accounts.is_empty() {
         return Ok("no accounts configured — serving the ambient `claude` login".to_string());
     }
