@@ -157,7 +157,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     let mut names: Vec<String> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut tool_index: BTreeMap<String, String> = BTreeMap::new();
-    // The operator's allowlist (`/claude tools`, default bash-only): only
+    // The operator's allowlist (`/claude tools`, default bash + subagent tools): only
     // passing tools reach the `gray` MCP inventory the child can call.
     let policy = crate::settings::ToolPolicy::load();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
