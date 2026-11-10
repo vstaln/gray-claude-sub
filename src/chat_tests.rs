@@ -113,6 +113,28 @@ fn usage_reports_cache_reads_and_writes() {
 }
 
 #[test]
+fn usage_reports_thinking_tokens() {
+    // Anthropic counts thinking inside output_tokens and breaks it out at
+    // output_tokens_details.thinking_tokens — forward it as
+    // reasoning_tokens or the host gauge under-reports the turn.
+    let lines = vec![
+        json!({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 2, "output_tokens": 9,
+                "output_tokens_details": {"thinking_tokens": 5}}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+            "usage": {"input_tokens": 4, "output_tokens": 12,
+                "output_tokens_details": {"thinking_tokens": 8}}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (sse, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.output_tokens, 12);
+    assert_eq!(usage.reasoning_tokens, 8);
+    let s = String::from_utf8(sse).unwrap();
+    assert!(s.contains("\"reasoning_tokens\":8"), "{s}");
+}
+
+#[test]
 fn parked_turn_reports_assistant_usage() {
     // A turn that ends on parked tool calls returns no `result` line —
     // the query is still open. Usage must come from `message.usage` on
