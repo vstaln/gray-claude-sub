@@ -972,7 +972,8 @@ pub fn fold_lines(
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
         "input_tokens_details": {"cached_tokens": usage.cached_tokens,
-            "cache_creation_tokens": usage.cache_write_tokens}});
+            "cache_creation_tokens": usage.cache_write_tokens},
+        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens}});
     emit(
         &mut sse,
         &json!({"type": "response.completed",
@@ -991,6 +992,8 @@ pub struct Usage {
     pub cached_tokens: usize,
     /// `cache_creation_input_tokens` — a subset of `input_tokens`.
     pub cache_write_tokens: usize,
+    /// `output_tokens_details.thinking_tokens` — a subset of `output_tokens`.
+    pub reasoning_tokens: usize,
 }
 
 /// `result` usage is the settled query's truth where assistant snapshots
@@ -1019,6 +1022,7 @@ fn map_result_usage(u: &Value, last_request: Option<&Usage>) -> Usage {
             output_tokens: top.output_tokens,
             cached_tokens: req.cached_tokens,
             cache_write_tokens: req.cache_write_tokens,
+            reasoning_tokens: top.reasoning_tokens,
         },
         None => top,
     }
@@ -1035,11 +1039,16 @@ pub fn map_usage(u: &Value) -> Usage {
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
+    let thinking = u
+        .pointer("/output_tokens_details/thinking_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
     Usage {
         input_tokens: input.saturating_add(read).saturating_add(write),
         output_tokens: output,
         cached_tokens: read,
         cache_write_tokens: write,
+        reasoning_tokens: thinking,
     }
 }
 
