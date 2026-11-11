@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,7 +41,7 @@ const SOLE_CAP: u64 = 60;
 const MAX_RESET: u64 = 8 * 24 * 3600;
 
 /// One credential home in the pool. `home` is the `CLAUDE_CONFIG_DIR`
-/// the spawned `claude` child gets; health fields are write-through.
+/// the spawned `claude` child gets; health is write-through.
 #[derive(Serialize, Deserialize)]
 pub struct Account {
     pub label: String,
@@ -52,15 +52,61 @@ pub struct Account {
     pub org: Option<String>,
     #[serde(default)]
     pub added_at: u64,
+    #[serde(default)]
+    pub health: Health,
     /// Unix seconds the cooldown ends; 0 = not cooling.
-    #[serde(default)]
-    pub cooldown_until: u64,
-    #[serde(default)]
-    pub last_error: Option<String>,
+    #[serde(default, skip_serializing)]
+    cooldown_until: u64,
+    #[serde(default, skip_serializing)]
+    last_error: Option<String>,
     #[serde(default)]
     pub request_count: u64,
     #[serde(default)]
     pub last_used_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Health {
+    Cooling {
+        until: u64,
+        reason: String,
+    },
+    AuthFailed {
+        until: u64,
+        msg: String,
+    },
+    #[default]
+    #[serde(other)]
+    Ready,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Strategy {
+    LeastUsed,
+    #[default]
+    #[serde(other)]
+    FillFirst,
+}
+
+impl Strategy {
+    fn name(self) -> &'static str {
+        match self {
+            Strategy::FillFirst => "fill_first",
+            Strategy::LeastUsed => "least_used",
+        }
+    }
+}
+
+enum Verdict {
+    Unauthorized,
+    RateLimited { retry_after: Option<Duration> },
+}
+
+enum Outcome {
+    Served,
+    Refused { verdict: Verdict, detail: String },
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -72,7 +118,39 @@ struct Store {
     selected: Option<String>,
     /// `fill_first` (default) or `least_used`.
     #[serde(default)]
-    strategy: String,
+    strategy: Strategy,
+}
+
+impl Store {
+    fn parse(text: &str) -> Result<Store, serde_json::Error> {
+        let mut store: Store = serde_json::from_str(text)?;
+        for a in &mut store.accounts {
+            a.adopt_legacy();
+        }
+        Ok(store)
+    }
+}
+
+impl Account {
+    fn adopt_legacy(&mut self) {
+        let until = std::mem::take(&mut self.cooldown_until);
+        let msg = self.last_error.take().unwrap_or_default();
+        if until == 0 || self.health != Health::Ready {
+            return;
+        }
+        let auth = matches!(crate::chat::api_error(&msg), Some((401, _)));
+        self.health = if auth {
+            Health::AuthFailed { until, msg }
+        } else {
+            Health::Cooling { until, reason: msg }
+        };
+    }
+}
+
+pub enum Serving {
+    Account(Pick),
+    Ambient,
+    AllCooling { until: u64, reason: String },
 }
 
 /// The account a turn is served by: label plus the credential home the
@@ -120,24 +198,97 @@ fn homes_dir() -> Option<PathBuf> {
 }
 
 fn load() -> Store {
+    load_checked().unwrap_or_default()
+}
+
+fn load_checked() -> Result<Store, String> {
     let Some(path) = file_path() else {
-        return Store::default();
+        return Ok(Store::default());
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Store::default();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => Ok(Store::default()),
+        Ok(text) => Store::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
-fn save(store: &Store) -> Result<(), String> {
+fn mutate<T>(durable: bool, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
     let path = file_path().ok_or("cannot resolve GRAY_HOME")?;
-    let text = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    crate::session::write_atomic(&path, text.as_bytes())
-        .map_err(|e| format!("{}: {e}", path.display()))
+    let _lock =
+        crate::session::lock_file(&path).map_err(|e| format!("lock {}: {e}", path.display()))?;
+    let mut store = match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => Store::default(),
+        Ok(text) => Store::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let before = serde_json::to_value(&store).map_err(|e| e.to_string())?;
+    let out = f(&mut store)?;
+    if serde_json::to_value(&store).map_err(|e| e.to_string())? != before {
+        let text = serde_json::to_string_pretty(&store).map_err(|e| e.to_string())?;
+        let bytes = text.as_bytes();
+        let written = if durable {
+            crate::session::write_durable(&path, bytes)
+        } else {
+            crate::session::write_atomic(&path, bytes)
+        };
+        written.map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(out)
 }
 
-fn cooled(a: &Account, now: u64) -> bool {
-    a.cooldown_until > now
+fn current(a: &Account, now: u64) -> Health {
+    match &a.health {
+        Health::Cooling { until, .. } | Health::AuthFailed { until, .. } if *until > now => {
+            a.health.clone()
+        }
+        _ => Health::Ready,
+    }
+}
+
+fn until_of(h: &Health) -> u64 {
+    match h {
+        Health::Ready => 0,
+        Health::Cooling { until, .. } | Health::AuthFailed { until, .. } => *until,
+    }
+}
+
+fn reason_of(h: &Health) -> Option<String> {
+    match h {
+        Health::Ready => None,
+        Health::Cooling { reason, .. } => Some(reason.clone()),
+        Health::AuthFailed { msg, .. } => Some(msg.clone()),
+    }
+}
+
+fn usable(a: &Account, now: u64) -> bool {
+    matches!(current(a, now), Health::Ready)
+}
+
+fn transition(h: &Health, outcome: &Outcome, now: u64, lone: bool) -> Health {
+    let (verdict, detail) = match outcome {
+        Outcome::Served => return Health::Ready,
+        Outcome::Refused { verdict, detail } => (verdict, detail),
+    };
+    let (ttl, auth) = match verdict {
+        Verdict::Unauthorized => (COOL_401, true),
+        Verdict::RateLimited { retry_after } => (
+            match retry_after {
+                Some(d) => d.as_secs().min(MAX_RESET),
+                None => COOL_429,
+            },
+            false,
+        ),
+    };
+    let cap = if lone { SOLE_CAP } else { MAX_RESET };
+    let until = until_of(h).max(now + ttl.min(cap).max(1));
+    let msg: String = detail.chars().take(200).collect();
+    if auth {
+        Health::AuthFailed { until, msg }
+    } else {
+        Health::Cooling { until, reason: msg }
+    }
 }
 
 fn pick_of(a: &Account) -> Pick {
@@ -147,9 +298,9 @@ fn pick_of(a: &Account) -> Pick {
     }
 }
 
-fn pick_from(store: &Store) -> Result<Option<Pick>, String> {
+fn serve(store: &Store) -> Serving {
     if store.accounts.is_empty() {
-        return Ok(None);
+        return Serving::Ambient;
     }
     let now = now_secs();
     // A usable pinned account always serves.
@@ -157,67 +308,73 @@ fn pick_from(store: &Store) -> Result<Option<Pick>, String> {
         && let Some(a) = store
             .accounts
             .iter()
-            .find(|a| a.label == sel && !cooled(a, now))
+            .find(|a| a.label == sel && usable(a, now))
     {
-        return Ok(Some(pick_of(a)));
+        return Serving::Account(pick_of(a));
     }
-    let next = if store.strategy == "least_used" {
-        store
+    let next = match store.strategy {
+        Strategy::LeastUsed => store
             .accounts
             .iter()
-            .filter(|a| !cooled(a, now))
-            .min_by_key(|a| a.last_used_at)
-    } else {
+            .filter(|a| usable(a, now))
+            .min_by_key(|a| a.last_used_at),
         // fill_first: file order is the priority order.
-        store.accounts.iter().find(|a| !cooled(a, now))
+        Strategy::FillFirst => store.accounts.iter().find(|a| usable(a, now)),
     };
     if let Some(a) = next {
-        return Ok(Some(pick_of(a)));
+        return Serving::Account(pick_of(a));
     }
     let soon = store
         .accounts
         .iter()
-        .min_by_key(|a| a.cooldown_until)
+        .min_by_key(|a| until_of(&current(a, now)))
         .expect("nonempty");
-    Err(format!(
-        "all {} claude accounts are cooling down; {} next at {}",
-        store.accounts.len(),
-        soon.label,
-        crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(soon.cooldown_until)),
-    ))
+    let until = until_of(&current(soon, now));
+    Serving::AllCooling {
+        until,
+        reason: format!(
+            "all {} claude accounts are cooling down; {} next at {}",
+            store.accounts.len(),
+            soon.label,
+            crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(until)),
+        ),
+    }
 }
 
 /// The account a turn would use — read-only (no use recorded). Probes
 /// and `provider/auth/*` use this; only `provider/chat` calls [`pick`].
-pub fn serving() -> Result<Option<Pick>, String> {
-    pick_from(&load())
+pub fn serving() -> Serving {
+    serve(&load())
 }
 
 /// Per-turn selection: resolve the serving account and record the use.
 pub fn pick() -> Result<Option<Pick>, String> {
-    let mut store = load();
-    let Some(p) = pick_from(&store)? else {
+    if load_checked()?.accounts.is_empty() {
         return Ok(None);
-    };
-    if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
-        a.request_count += 1;
-        a.last_used_at = now_secs();
-        let _ = save(&store);
     }
-    Ok(Some(p))
+    mutate(false, |store| match serve(store) {
+        Serving::Account(p) => {
+            if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
+                a.request_count += 1;
+                a.last_used_at = now_secs();
+            }
+            Ok(Some(p))
+        }
+        Serving::Ambient => Ok(None),
+        Serving::AllCooling { reason, .. } => Err(reason),
+    })
 }
 
 /// The turn this account served succeeded: clear any recorded failure.
 pub fn note_success(label: &str) {
-    let mut store = load();
-    let Some(a) = store.accounts.iter_mut().find(|a| a.label == label) else {
+    let store = load();
+    let Some(a) = store.accounts.iter().find(|a| a.label == label) else {
         return;
     };
-    if a.cooldown_until != 0 || a.last_error.is_some() {
-        a.cooldown_until = 0;
-        a.last_error = None;
-        let _ = save(&store);
+    if a.health == Health::Ready {
+        return;
     }
+    record(label, Outcome::Served);
 }
 
 /// The turn this account served failed with `detail`. Only account-
@@ -227,15 +384,21 @@ pub fn note_failure(label: &str, detail: &str) {
     let Some((code, msg)) = crate::chat::api_error(detail) else {
         return;
     };
-    let ttl = match code {
-        401 => COOL_401,
-        429 => parse_retry_after(msg)
-            .map(|d| d.as_secs().min(MAX_RESET))
-            .unwrap_or(COOL_429),
+    let verdict = match code {
+        401 => Verdict::Unauthorized,
+        429 => Verdict::RateLimited {
+            retry_after: parse_retry_after(msg),
+        },
         // Request-scoped verdicts never cool an account.
         _ => return,
     };
-    cool(label, ttl, detail);
+    record(
+        label,
+        Outcome::Refused {
+            verdict,
+            detail: detail.to_string(),
+        },
+    );
 }
 
 /// [`note_failure`] keyed by credential home: a keepalive probe knows
@@ -266,19 +429,15 @@ pub fn label_for_home(home: &Path) -> Option<String> {
         .map(|a| a.label.clone())
 }
 
-fn cool(label: &str, ttl: u64, detail: &str) {
-    let mut store = load();
-    let ttl = if store.accounts.len() == 1 {
-        ttl.min(SOLE_CAP)
-    } else {
-        ttl.min(MAX_RESET)
-    };
-    let Some(a) = store.accounts.iter_mut().find(|a| a.label == label) else {
-        return;
-    };
-    a.cooldown_until = now_secs() + ttl.max(1);
-    a.last_error = Some(detail.chars().take(200).collect());
-    let _ = save(&store);
+fn record(label: &str, outcome: Outcome) {
+    let _ = mutate(false, |store| {
+        let now = now_secs();
+        let lone = store.accounts.len() == 1;
+        if let Some(a) = store.accounts.iter_mut().find(|a| a.label == label) {
+            a.health = transition(&current(a, now), &outcome, now, lone);
+        }
+        Ok(())
+    });
 }
 
 // ---- retry-after / reset-hint parsing ------------------------------------
@@ -472,6 +631,7 @@ claude-sub account — multiple Claude logins behind one provider.
   claude-sub account strategy <fill_first|least_used>
                                                   pick order among usable accounts
   claude-sub account status                        which account serves now
+  claude-sub account usage [<label>]               quota windows per account, or one (--json)
   any verb accepts --json for the machine contract the host /accounts panel reads
 The file is <gray home>/claude-sub/accounts.json; absent or empty
 `accounts` keeps the single ambient `claude` login.";
@@ -496,6 +656,7 @@ pub fn command(args: &[String], interactive: bool) -> Result<String, String> {
         Some("remove") | Some("rm") => cmd_remove(&args[1..], json),
         Some("strategy") => cmd_strategy(&args[1..], json),
         Some("status") => cmd_status(json),
+        Some("usage") => cmd_usage(&args[1..], json),
         Some("list") | None => cmd_list(json),
         Some(other) => Err(format!("unknown account verb {other:?}\n\n{USAGE}")),
     }
@@ -504,48 +665,42 @@ pub fn command(args: &[String], interactive: bool) -> Result<String, String> {
 /// The machine-readable pool document. `ambient` is true when no pool is
 /// configured and the ambient `claude` login serves; `serving.kind` is
 /// `account`, `ambient`, `cooldown` (every account benched — `reason`
-/// names the earliest reset) or `none`.
+/// names the earliest reset).
 fn store_json(store: &Store) -> Result<String, String> {
     let now = now_secs();
     let accounts: Vec<Value> = store
         .accounts
         .iter()
         .map(|a| {
+            let health = current(a, now);
             json!({
                 "label": a.label,
                 "home": a.home.display().to_string(),
                 "email": a.email,
                 "org": a.org,
                 "added_at": a.added_at,
-                "cooldown_until": a.cooldown_until,
-                "cooling": cooled(a, now),
-                "last_error": a.last_error,
+                "cooldown_until": until_of(&health),
+                "cooling": !matches!(health, Health::Ready),
+                "last_error": reason_of(&health),
+                "health": health.clone(),
                 "request_count": a.request_count,
                 "last_used_at": a.last_used_at,
                 "pinned": store.selected.as_deref() == Some(a.label.as_str()),
             })
         })
         .collect();
-    let serving = match pick_from(store) {
-        Ok(Some(p)) => json!({"kind": "account", "label": p.label}),
-        Ok(None) if store.accounts.is_empty() => json!({"kind": "ambient"}),
-        Ok(None) => json!({"kind": "none"}),
-        Err(e) => {
-            let until = store
-                .accounts
-                .iter()
-                .map(|a| a.cooldown_until)
-                .filter(|u| *u > now)
-                .min()
-                .unwrap_or(0);
-            json!({"kind": "cooldown", "until": until, "reason": e})
+    let serving = match serve(store) {
+        Serving::Account(p) => json!({"kind": "account", "label": p.label}),
+        Serving::Ambient => json!({"kind": "ambient"}),
+        Serving::AllCooling { until, reason } => {
+            json!({"kind": "cooldown", "until": until, "reason": reason})
         }
     };
     serde_json::to_string_pretty(&json!({
         "version": 1,
         "plugin": crate::manifest::PLUGIN_NAME,
         "provider": crate::manifest::PROVIDER_ID,
-        "strategy": if store.strategy.is_empty() { "fill_first" } else { &store.strategy },
+        "strategy": store.strategy.name(),
         "selected": store.selected,
         "ambient": store.accounts.is_empty(),
         "accounts": accounts,
@@ -575,6 +730,94 @@ fn valid_label(label: &str) -> Result<(), String> {
         .ok_or_else(|| format!("bad label {label:?}: 1-40 chars of [A-Za-z0-9_-]"))
 }
 
+enum Source {
+    Adopt(PathBuf),
+    Managed(PathBuf),
+}
+
+impl Source {
+    fn home(&self) -> &Path {
+        match self {
+            Source::Adopt(h) | Source::Managed(h) => h.as_path(),
+        }
+    }
+}
+
+enum Insert {
+    Added {
+        selected: Option<String>,
+        who: String,
+    },
+    Duplicate {
+        label: String,
+        identity: String,
+    },
+}
+
+fn admit(label: &str, source: &Source) -> Result<Insert, String> {
+    let home = source.home().to_path_buf();
+    let st = crate::setup::auth_status(Some(&home))
+        .ok_or("`claude auth status` failed in the new home")?;
+    if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "no login in {} — {}",
+            home.display(),
+            if matches!(source, Source::Managed(_)) {
+                "`claude auth login` did not complete"
+            } else {
+                "adopt a directory that holds a real login"
+            },
+        ));
+    }
+    let email = st.get("email").and_then(Value::as_str).map(str::to_string);
+    let org = st
+        .get("orgName")
+        .and_then(Value::as_str)
+        .or_else(|| st.get("orgId").and_then(Value::as_str))
+        .map(str::to_string);
+    let who = email
+        .clone()
+        .unwrap_or_else(|| "identity pending".to_string());
+    // Dedupe on a verified upstream identity only — `email`/`orgId` can
+    // be null until the first online call, and a null never proves two
+    // homes are the same account.
+    mutate(true, |store| {
+        if store.accounts.iter().any(|a| a.label == label) {
+            return Err(format!("account {label:?} already exists"));
+        }
+        if let (Some(e), Some(o)) = (&email, &org)
+            && let Some(dup) = store
+                .accounts
+                .iter()
+                .find(|a| a.email.as_ref() == Some(e) && a.org.as_ref() == Some(o))
+        {
+            return Ok(Insert::Duplicate {
+                label: dup.label.clone(),
+                identity: format!("{e} / {o}"),
+            });
+        }
+        store.accounts.push(Account {
+            label: label.to_string(),
+            home: home.clone(),
+            email: email.clone(),
+            org: org.clone(),
+            added_at: now_secs(),
+            health: Health::Ready,
+            cooldown_until: 0,
+            last_error: None,
+            request_count: 0,
+            last_used_at: 0,
+        });
+        if store.selected.is_none() {
+            store.selected = Some(label.to_string());
+        }
+        Ok(Insert::Added {
+            selected: store.selected.clone(),
+            who: who.clone(),
+        })
+    })
+}
+
 fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, String> {
     let mut home: Option<PathBuf> = None;
     let mut label: Option<String> = None;
@@ -595,122 +838,104 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
     }
     let label = label.ok_or_else(|| format!("account add needs a label\n\n{USAGE}"))?;
     valid_label(&label)?;
-    let mut store = load();
-    if store.accounts.iter().any(|a| a.label == label) {
+    if load().accounts.iter().any(|a| a.label == label) {
         return Err(format!("account {label:?} already exists"));
     }
     let binary = crate::setup::resolve_command().ok_or(crate::setup::INSTALL_HINT)?;
-    let managed = home.is_none();
-    let home = match home {
-        Some(h) => h,
-        None => homes_dir().ok_or("cannot resolve GRAY_HOME")?.join(&label),
+    let source = match home {
+        Some(h) => Source::Adopt(h),
+        None => Source::Managed(homes_dir().ok_or("cannot resolve GRAY_HOME")?.join(&label)),
     };
-    if managed {
+    if let Source::Managed(dest) = &source {
         if !interactive {
             return Err(
                 "account add runs `claude auth login`; use `gray claude-sub account add <label>` in a terminal"
                     .into(),
             );
         }
-        std::fs::create_dir_all(&home).map_err(|e| format!("create {}: {e}", home.display()))?;
+        let root = dest.parent().ok_or("cannot resolve GRAY_HOME")?;
+        std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
+        let tmp = root.join(format!(
+            ".{label}.{}.{}.tmp",
+            std::process::id(),
+            crate::session::new_uuid()
+        ));
+        std::fs::create_dir(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
         }
-        eprintln!("logging {label:?} into {} …", home.display());
+        eprintln!("logging {label:?} into {} …", dest.display());
         let status = std::process::Command::new(&binary)
             .args(["auth", "login"])
             .envs(crate::setup::child_env())
-            .env("CLAUDE_CONFIG_DIR", &home)
+            .env("CLAUDE_CONFIG_DIR", &tmp)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .map_err(|e| format!("spawn claude auth login: {e}"))?;
-        if !status.success() {
-            return Err(format!("`claude auth login` exited {status}"));
+            .map_err(|e| format!("spawn claude auth login: {e}"));
+        let placed = status
+            .and_then(|s| {
+                if s.success() {
+                    Ok(())
+                } else {
+                    Err(format!("`claude auth login` exited {s}"))
+                }
+            })
+            .and_then(|()| {
+                std::fs::rename(&tmp, dest).map_err(|e| format!("place {}: {e}", dest.display()))
+            });
+        if let Err(e) = placed {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
         }
     }
-    let st = crate::setup::auth_status(Some(&home))
-        .ok_or("`claude auth status` failed in the new home")?;
-    if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
-        return Err(format!(
-            "no login in {} — {}",
-            home.display(),
-            if managed {
-                "`claude auth login` did not complete"
-            } else {
-                "adopt a directory that holds a real login"
-            },
-        ));
-    }
-    let email = st.get("email").and_then(Value::as_str).map(str::to_string);
-    let org = st
-        .get("orgName")
-        .and_then(Value::as_str)
-        .or_else(|| st.get("orgId").and_then(Value::as_str))
-        .map(str::to_string);
-    // Dedupe on a verified upstream identity only — `email`/`orgId` can
-    // be null until the first online call, and a null never proves two
-    // homes are the same account.
-    if let (Some(e), Some(o)) = (&email, &org)
-        && let Some(dup) = store
-            .accounts
-            .iter()
-            .find(|a| a.email.as_ref() == Some(e) && a.org.as_ref() == Some(o))
-    {
-        // The login we just made is a duplicate — drop the managed home
-        // it wrote into; adopted `--home` dirs are never touched.
-        if managed
-            && let Some(dir) = homes_dir()
-            && home.starts_with(&dir)
-        {
-            let _ = std::fs::remove_dir_all(&home);
+    let insert = match admit(&label, &source) {
+        Ok(insert) => insert,
+        Err(e) => {
+            if let Source::Managed(dest) = &source {
+                let _ = std::fs::remove_dir_all(dest);
+            }
+            return Err(e);
         }
-        return Err(format!(
-            "that login is already registered as {:?} ({e} / {o})",
-            dup.label
-        ));
+    };
+    match insert {
+        Insert::Duplicate {
+            label: dup,
+            identity,
+        } => {
+            // The login we just made is a duplicate — drop the managed home
+            // it wrote into; adopted `--home` dirs are never touched.
+            if let Source::Managed(dest) = &source {
+                let _ = std::fs::remove_dir_all(dest);
+            }
+            Err(format!(
+                "that login is already registered as {dup:?} ({identity})"
+            ))
+        }
+        Insert::Added { selected, who } => {
+            if json {
+                return ok_json(json!({
+                    "message": format!("account {label:?} added"),
+                    "label": label,
+                    "email": who,
+                    "selected": selected,
+                }));
+            }
+            Ok(format!(
+                "account {label:?} added ({who}); home {}",
+                source.home().display()
+            ))
+        }
     }
-    store.accounts.push(Account {
-        label: label.clone(),
-        home: home.clone(),
-        email,
-        org,
-        added_at: now_secs(),
-        cooldown_until: 0,
-        last_error: None,
-        request_count: 0,
-        last_used_at: 0,
-    });
-    if store.selected.is_none() {
-        store.selected = Some(label.clone());
-    }
-    save(&store)?;
-    let who = store
-        .accounts
-        .last()
-        .and_then(|a| a.email.clone())
-        .unwrap_or_else(|| "identity pending".to_string());
-    if json {
-        return ok_json(json!({
-            "message": format!("account {label:?} added"),
-            "label": label,
-            "email": who,
-            "selected": store.selected,
-        }));
-    }
-    Ok(format!(
-        "account {label:?} added ({who}); home {}",
-        home.display()
-    ))
 }
 
 fn cmd_use(args: &[String], json: bool) -> Result<String, String> {
-    let mut store = load();
     match args.first().map(String::as_str) {
         None => {
+            let store = load();
             let sel = store.selected.as_deref().unwrap_or("(none)");
             if json {
                 return ok_json(json!({"selected": store.selected}));
@@ -718,21 +943,25 @@ fn cmd_use(args: &[String], json: bool) -> Result<String, String> {
             Ok(format!("pinned account: {sel}"))
         }
         Some("--clear") | Some("none") | Some("auto") => {
-            store.selected = None;
-            save(&store)?;
+            let selected = mutate(true, |store| {
+                store.selected = None;
+                Ok(store.selected.clone())
+            })?;
             if json {
-                return ok_json(json!({"selected": store.selected}));
+                return ok_json(json!({"selected": selected}));
             }
             Ok("pin cleared — selection follows the strategy".to_string())
         }
         Some(label) => {
-            if !store.accounts.iter().any(|a| a.label == label) {
-                return Err(format!("no account {label:?}"));
-            }
-            store.selected = Some(label.to_string());
-            save(&store)?;
+            let selected = mutate(true, |store| {
+                if !store.accounts.iter().any(|a| a.label == label) {
+                    return Err(format!("no account {label:?}"));
+                }
+                store.selected = Some(label.to_string());
+                Ok(store.selected.clone())
+            })?;
             if json {
-                return ok_json(json!({"selected": store.selected}));
+                return ok_json(json!({"selected": selected}));
             }
             Ok(format!("serving account: {label}"))
         }
@@ -742,31 +971,30 @@ fn cmd_use(args: &[String], json: bool) -> Result<String, String> {
 /// `account strategy fill_first|least_used` — bare prints the current
 /// strategy. Selection among non-cooled accounts only; the pin still wins.
 fn cmd_strategy(args: &[String], json: bool) -> Result<String, String> {
-    let mut store = load();
-    match args.first().map(String::as_str) {
+    let next = match args.first().map(String::as_str) {
         None => {
-            let cur = if store.strategy.is_empty() {
-                "fill_first"
-            } else {
-                &store.strategy
-            };
+            let cur = load().strategy.name();
             if json {
                 return ok_json(json!({"strategy": cur}));
             }
-            Ok(format!("strategy: {cur}"))
+            return Ok(format!("strategy: {cur}"));
         }
-        Some("fill_first") | Some("least_used") => {
-            store.strategy = args[0].clone();
-            save(&store)?;
-            if json {
-                return ok_json(json!({"strategy": store.strategy}));
-            }
-            Ok(format!("strategy: {}", store.strategy))
+        Some("fill_first") => Strategy::FillFirst,
+        Some("least_used") => Strategy::LeastUsed,
+        Some(other) => {
+            return Err(format!(
+                "unknown strategy {other:?} — fill_first or least_used"
+            ));
         }
-        Some(other) => Err(format!(
-            "unknown strategy {other:?} — fill_first or least_used"
-        )),
+    };
+    let set = mutate(true, |store| {
+        store.strategy = next;
+        Ok(store.strategy.name())
+    })?;
+    if json {
+        return ok_json(json!({"strategy": set}));
     }
+    Ok(format!("strategy: {set}"))
 }
 
 fn cmd_remove(args: &[String], json: bool) -> Result<String, String> {
@@ -782,15 +1010,16 @@ fn cmd_remove(args: &[String], json: bool) -> Result<String, String> {
         }
     }
     let label = label.ok_or_else(|| format!("account remove needs a label\n\n{USAGE}"))?;
-    let mut store = load();
-    let Some(i) = store.accounts.iter().position(|a| a.label == label) else {
-        return Err(format!("no account {label:?}"));
-    };
-    let acc = store.accounts.remove(i);
-    if store.selected.as_deref() == Some(label.as_str()) {
-        store.selected = None;
-    }
-    save(&store)?;
+    let acc = mutate(true, |store| {
+        let Some(i) = store.accounts.iter().position(|a| a.label == label) else {
+            return Err(format!("no account {label:?}"));
+        };
+        let acc = store.accounts.remove(i);
+        if store.selected.as_deref() == Some(label.as_str()) {
+            store.selected = None;
+        }
+        Ok(acc)
+    })?;
     // Only homes we created are ours to delete; adopted `--home` dirs
     // belong to the user.
     let mut msg = format!("account {label:?} removed");
@@ -815,13 +1044,16 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
     } else {
         ' '
     };
-    let state = if cooled(a, now) {
-        format!(
+    let state = match current(a, now) {
+        Health::Ready => "ok".to_string(),
+        Health::Cooling { until, .. } => format!(
             "cooled until {}",
-            crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(a.cooldown_until))
-        )
-    } else {
-        "ok".to_string()
+            crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(until))
+        ),
+        Health::AuthFailed { until, .. } => format!(
+            "auth failed until {}",
+            crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(until))
+        ),
     };
     let who = a.email.clone().unwrap_or_else(|| "-".to_string());
     format!(
@@ -834,7 +1066,7 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
 }
 
 fn cmd_list(json: bool) -> Result<String, String> {
-    let store = load();
+    let store = load_checked()?;
     if json {
         return store_json(&store);
     }
@@ -852,35 +1084,163 @@ fn cmd_list(json: bool) -> Result<String, String> {
 }
 
 fn cmd_status(json: bool) -> Result<String, String> {
-    let store = load();
+    let store = load_checked()?;
     if json {
         return store_json(&store);
     }
     if store.accounts.is_empty() {
         return Ok("no accounts configured — serving the ambient `claude` login".to_string());
     }
-    let mut out = match pick_from(&store) {
-        Ok(Some(p)) => format!("serving account: {} (home {})\n", p.label, p.home.display()),
-        Ok(None) => "serving account: (none)".to_string(),
-        Err(e) => format!("serving account: {e}\n"),
-    };
-    out.push_str(&format!(
-        "strategy: {}\n",
-        if store.strategy.is_empty() {
-            "fill_first"
-        } else {
-            &store.strategy
-        }
-    ));
     let now = now_secs();
+    let mut out = match serve(&store) {
+        Serving::Account(p) => {
+            format!("serving account: {} (home {})\n", p.label, p.home.display())
+        }
+        Serving::Ambient => "serving account: (none)".to_string(),
+        Serving::AllCooling { reason, .. } => format!("serving account: {reason}\n"),
+    };
+    out.push_str(&format!("strategy: {}\n", store.strategy.name()));
     for a in &store.accounts {
         out.push_str(&account_line(a, now, &store.selected));
-        if let Some(e) = &a.last_error {
+        if let Some(e) = reason_of(&current(a, now)) {
             out.push_str(&format!("  last error: {e}"));
         }
         out.push('\n');
     }
     Ok(out)
+}
+
+const USAGE_DEADLINE: Duration = Duration::from_secs(crate::usage::PROBE_TIMEOUT.as_secs() + 5);
+
+fn usage_entry(label: Option<String>, outcome: Result<Value, String>) -> Value {
+    match outcome {
+        Ok(card) => json!({"label": label, "usage": card, "error": null}),
+        Err(e) => json!({"label": label, "usage": null, "error": e}),
+    }
+}
+
+type UsageTargets = Vec<(Option<String>, Result<Option<Pick>, String>)>;
+
+fn usage_targets(store: &Store, want: Option<&str>) -> UsageTargets {
+    if store.accounts.is_empty() {
+        return match want {
+            None => vec![(None, Ok(None))],
+            Some(w) => vec![(
+                Some(w.to_string()),
+                Err(format!(
+                    "no account labelled {w:?}: no pool configured, the ambient login has no label"
+                )),
+            )],
+        };
+    }
+    let picked: UsageTargets = store
+        .accounts
+        .iter()
+        .filter(|a| want.is_none_or(|w| a.label == w))
+        .map(|a| (Some(a.label.clone()), Ok(Some(pick_of(a)))))
+        .collect();
+    match want {
+        Some(w) if picked.is_empty() => vec![(
+            Some(w.to_string()),
+            Err(format!("no account labelled {w:?}")),
+        )],
+        _ => picked,
+    }
+}
+
+fn usage_text(entry: &Value) -> String {
+    let mut out = match entry.get("label").and_then(Value::as_str) {
+        Some(l) => format!("{l}\n"),
+        None => "ambient\n".to_string(),
+    };
+    if let Some(e) = entry.get("error").and_then(Value::as_str) {
+        out.push_str(&format!("  error: {e}\n"));
+    }
+    let windows = entry.pointer("/usage/windows").and_then(Value::as_array);
+    if entry.get("usage").is_some_and(|u| !u.is_null()) && windows.is_none_or(Vec::is_empty) {
+        out.push_str("  no quota windows reported\n");
+    }
+    for w in windows.into_iter().flatten() {
+        let name = w
+            .get("label")
+            .or(w.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let pct = w
+            .get("used_percent")
+            .and_then(Value::as_f64)
+            .map_or("-".to_string(), |p| format!("{p:.0}%"));
+        let reset = w.get("resets_at").and_then(Value::as_str).unwrap_or("-");
+        out.push_str(&format!("  {name:<14} {pct:>5}  resets {reset}\n"));
+    }
+    out.trim_end().to_string()
+}
+
+enum Fetch {
+    Pending,
+    Loaded(Value),
+    Failed(String),
+}
+
+impl Fetch {
+    fn settle(self) -> Result<Value, String> {
+        match self {
+            Fetch::Pending => Err(format!("no reply within {}s", USAGE_DEADLINE.as_secs())),
+            Fetch::Loaded(card) => Ok(card),
+            Fetch::Failed(e) => Err(e),
+        }
+    }
+}
+
+fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
+    let want = args.first().map(String::as_str);
+    let targets = usage_targets(&load_checked()?, want);
+    let labels: Vec<Option<String>> = targets.iter().map(|(l, _)| l.clone()).collect();
+    let mut fetches: Vec<Fetch> = targets
+        .iter()
+        .map(|(_, target)| match target {
+            Err(e) => Fetch::Failed(e.clone()),
+            Ok(_) => Fetch::Pending,
+        })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (i, (_, target)) in targets.into_iter().enumerate() {
+        if let Ok(pick) = target {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let outcome = crate::usage::handle(pick.as_ref()).map_err(|e| e.to_string());
+                let _ = tx.send((i, outcome));
+            });
+        }
+    }
+    drop(tx);
+    let deadline = Instant::now() + USAGE_DEADLINE;
+    while let Ok((i, outcome)) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        fetches[i] = match outcome {
+            Ok(card) => Fetch::Loaded(card),
+            Err(e) => Fetch::Failed(e),
+        };
+    }
+    let entries: Vec<Value> = fetches
+        .into_iter()
+        .zip(labels)
+        .map(|(fetch, label)| usage_entry(label, fetch.settle()))
+        .collect();
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "plugin": crate::manifest::PLUGIN_NAME,
+            "provider": crate::manifest::PROVIDER_ID,
+            "accounts": entries,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    Ok(entries
+        .iter()
+        .map(usage_text)
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// The pick an auth or usage probe uses: the serving account, or — when
@@ -890,8 +1250,8 @@ fn cmd_status(json: bool) -> Result<String, String> {
 pub fn probe_pick() -> Option<Pick> {
     let store = load();
     let first = store.accounts.first()?;
-    Some(match pick_from(&store) {
-        Ok(Some(p)) => p,
+    Some(match serve(&store) {
+        Serving::Account(p) => p,
         _ => pick_of(first),
     })
 }

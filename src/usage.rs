@@ -27,7 +27,7 @@ use gray_plugin::ProviderRpcError;
 const CACHE_TTL_SECS: u64 = 5 * 60;
 /// Hard cap on the probe child's lifetime: init + control_response is
 /// normally seconds; a hung spawn must not hang `/usage`.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 
 const SESSION_MINS: u64 = 5 * 60;
 const WEEK_MINS: u64 = 7 * 24 * 60;
@@ -87,12 +87,11 @@ fn write_cache(limits: &Value, fetched: u64, label: Option<&str>) {
     let Some(path) = cache_path(label) else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(
-        path,
-        json!({"fetched_at": fetched, "limits": limits}).to_string(),
+    let _ = crate::session::write_atomic(
+        &path,
+        json!({"fetched_at": fetched, "limits": limits})
+            .to_string()
+            .as_bytes(),
     );
 }
 

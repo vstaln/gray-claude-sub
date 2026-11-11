@@ -145,8 +145,30 @@ pub fn iso_timestamp(t: SystemTime) -> String {
 /// creating the parent directory. Concurrent writers never expose a torn
 /// file: readers see the old content or the new, whole.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let dir = path.parent().unwrap_or(Path::new("."));
+    write_via_tmp(path, bytes, false)
+}
+
+pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_via_tmp(path, bytes, true)
+}
+
+pub fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    ensure_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(std::path::PathBuf::from(lock))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     let mut mkdir = std::fs::DirBuilder::new();
     mkdir.recursive(true);
     #[cfg(unix)]
@@ -154,7 +176,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         mkdir.mode(0o700);
     }
-    mkdir.create(dir)?;
+    mkdir.create(dir)
+}
+
+fn write_via_tmp(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    ensure_dir(dir)?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), new_uuid()));
     let mut opts = std::fs::OpenOptions::new();
@@ -166,7 +194,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let res = opts
         .open(&tmp)
-        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            if sync {
+                f.sync_all()?;
+            }
+            Ok(())
+        })
         .and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
