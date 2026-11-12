@@ -1208,7 +1208,17 @@ fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
         if let Ok(pick) = target {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let outcome = crate::usage::handle(pick.as_ref()).map_err(|e| e.to_string());
+                let outcome = crate::usage::handle(pick.as_ref())
+                    .map(|mut card| {
+                        if pick.is_none()
+                            && let Some(email) = crate::setup::auth_status(None)
+                                .and_then(|s| s.get("email")?.as_str().map(str::to_string))
+                        {
+                            card["email"] = json!(email);
+                        }
+                        card
+                    })
+                    .map_err(|e| e.to_string());
                 let _ = tx.send((i, outcome));
             });
         }
