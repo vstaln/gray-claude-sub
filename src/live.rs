@@ -1504,6 +1504,7 @@ fn spawn_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .envs(setup::child_env())
+        .env("CLAUDE_CODE_ENTRYPOINT", "gray")
         .env("ENABLE_TOOL_SEARCH", "false")
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env("DISABLE_AUTO_COMPACT", "1")

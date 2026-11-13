@@ -166,7 +166,8 @@ fn probe(home: Option<&std::path::Path>) -> Result<Value, ProviderRpcError> {
     ])
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
-    .stderr(Stdio::null());
+    .stderr(Stdio::null())
+    .env("CLAUDE_CODE_ENTRYPOINT", "gray");
     if let Some(h) = home {
         cmd.env("CLAUDE_CONFIG_DIR", h);
     }
