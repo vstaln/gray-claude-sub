@@ -289,7 +289,7 @@ fn run_turn(
     // One live native session per conversation: a continuing request
     // writes only its delta into the pooled child; tool calls park inside
     // the child's `gray` MCP server until a later turn answers them.
-    let home = intent.account.as_ref().map(|p| p.home.as_path());
+    let home = intent.account.as_ref().and_then(|p| p.home.as_deref());
     let result = if isolated {
         crate::live::run_isolated(&body, &intent.model, effort, crate::live::turn_cap(), home)
     } else {

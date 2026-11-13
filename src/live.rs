@@ -580,9 +580,7 @@ pub(crate) fn finish_refresh(mut s: LiveSession, err: Option<&str>) {
         Some(e) => {
             if chat::api_error(e).is_some_and(|(c, _)| c == 429) {
                 s.rate_limited = true;
-                if let Some(h) = s.home.as_deref() {
-                    crate::accounts::note_failure_home(h, e);
-                }
+                crate::accounts::note_failure_home(s.home.as_deref(), e);
             }
             s.failures += 1;
             if !s.settle(e) {
@@ -1092,10 +1090,7 @@ impl LiveSession {
                 // so quota rows stay warm between probes.
                 crate::usage::note_event(
                     &v,
-                    self.home
-                        .as_deref()
-                        .and_then(crate::accounts::label_for_home)
-                        .as_deref(),
+                    crate::accounts::label_for_home(self.home.as_deref()).as_deref(),
                 );
             }
             _ => {}
@@ -1604,7 +1599,7 @@ fn spawn_child(
 /// resume can't mount — the record then degrades back to a plain
 /// cold-start point for [`spawn_conversation`].
 fn spawn_idle(rec: &session::Record) -> Option<LiveSession> {
-    let home = rec.home_path();
+    let home = (!rec.home.is_empty()).then(|| PathBuf::from(&rec.home));
     if !session::session_exists(&rec.sid, home.as_deref()) {
         return None;
     }

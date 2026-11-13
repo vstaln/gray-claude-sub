@@ -61,7 +61,7 @@ pub fn handle(account: Option<&crate::accounts::Pick>) -> Result<Value, Provider
     {
         return Ok(limits);
     }
-    match probe(account.map(|p| p.home.as_path())) {
+    match probe(account.and_then(|p| p.home.as_deref())) {
         Ok(limits) => {
             write_cache(&limits, now_secs(), label);
             Ok(limits)

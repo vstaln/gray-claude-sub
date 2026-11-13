@@ -41,7 +41,8 @@ const SOLE_CAP: u64 = 60;
 const MAX_RESET: u64 = 8 * 24 * 3600;
 
 /// One credential home in the pool. `home` is the `CLAUDE_CONFIG_DIR`
-/// the spawned `claude` child gets; health is write-through.
+/// the spawned `claude` child gets (empty = the ambient login, spawned
+/// with none); health is write-through.
 #[derive(Serialize, Deserialize)]
 pub struct Account {
     pub label: String,
@@ -154,10 +155,11 @@ pub enum Serving {
 }
 
 /// The account a turn is served by: label plus the credential home the
-/// spawned `claude` children get as `CLAUDE_CONFIG_DIR`.
+/// spawned `claude` children get as `CLAUDE_CONFIG_DIR` (`None` = the
+/// ambient login, no variable set).
 pub struct Pick {
     pub label: String,
-    pub home: PathBuf,
+    pub home: Option<PathBuf>,
 }
 
 fn now_secs() -> u64 {
@@ -186,6 +188,22 @@ pub fn expand_home(p: &Path) -> PathBuf {
 fn normalize(p: &Path) -> PathBuf {
     let expanded = expand_home(p);
     std::fs::canonicalize(&expanded).unwrap_or(expanded)
+}
+
+fn spawn_home(home: &Path) -> Option<&Path> {
+    (!home.as_os_str().is_empty()).then_some(home)
+}
+
+fn owns(a: &Account, want: &Option<PathBuf>) -> bool {
+    match (spawn_home(&a.home), want) {
+        (None, None) => true,
+        (Some(h), Some(w)) => normalize(h) == *w,
+        _ => false,
+    }
+}
+
+fn home_text(home: &Path) -> String {
+    spawn_home(home).map_or("(ambient login)".to_string(), |h| h.display().to_string())
 }
 
 fn file_path() -> Option<PathBuf> {
@@ -294,7 +312,7 @@ fn transition(h: &Health, outcome: &Outcome, now: u64, lone: bool) -> Health {
 fn pick_of(a: &Account) -> Pick {
     Pick {
         label: a.label.clone(),
-        home: expand_home(&a.home),
+        home: spawn_home(&a.home).map(expand_home),
     }
 }
 
@@ -403,13 +421,13 @@ pub fn note_failure(label: &str, detail: &str) {
 
 /// [`note_failure`] keyed by credential home: a keepalive probe knows
 /// the session's `CLAUDE_CONFIG_DIR`, not its label.
-pub fn note_failure_home(home: &Path, detail: &str) {
-    let want = normalize(home);
+pub fn note_failure_home(home: Option<&Path>, detail: &str) {
+    let want = home.and_then(spawn_home).map(normalize);
     let store = load();
     let Some(label) = store
         .accounts
         .iter()
-        .find(|a| normalize(&a.home) == want)
+        .find(|a| owns(a, &want))
         .map(|a| a.label.clone())
     else {
         return;
@@ -420,12 +438,12 @@ pub fn note_failure_home(home: &Path, detail: &str) {
 
 /// The label of the account owning `home`, if any — `usage` keys its
 /// cache per account this way.
-pub fn label_for_home(home: &Path) -> Option<String> {
-    let want = normalize(home);
+pub fn label_for_home(home: Option<&Path>) -> Option<String> {
+    let want = home.and_then(spawn_home).map(normalize);
     load()
         .accounts
         .iter()
-        .find(|a| normalize(&a.home) == want)
+        .find(|a| owns(a, &want))
         .map(|a| a.label.clone())
 }
 
@@ -625,6 +643,9 @@ claude-sub account — multiple Claude logins behind one provider.
   claude-sub account add [--home <dir>] <label>   run `claude auth login` into a
                                                   new credential home (or adopt
                                                   an existing CLAUDE_CONFIG_DIR)
+  claude-sub account add --ambient <label>         adopt the plain `claude` login
+                                                  (spawned without CLAUDE_CONFIG_DIR);
+                                                  the first add does this on its own
   claude-sub account list                          accounts + health
   claude-sub account use <label>                   pin an account (use --clear to unpin)
   claude-sub account remove [--keep] <label>       drop an account (+its managed home)
@@ -733,12 +754,14 @@ fn valid_label(label: &str) -> Result<(), String> {
 enum Source {
     Adopt(PathBuf),
     Managed(PathBuf),
+    Ambient,
 }
 
 impl Source {
     fn home(&self) -> &Path {
         match self {
             Source::Adopt(h) | Source::Managed(h) => h.as_path(),
+            Source::Ambient => Path::new(""),
         }
     }
 }
@@ -756,18 +779,22 @@ enum Insert {
 
 fn admit(label: &str, source: &Source) -> Result<Insert, String> {
     let home = source.home().to_path_buf();
-    let st = crate::setup::auth_status(Some(&home))
+    let st = crate::setup::auth_status(spawn_home(&home))
         .ok_or("`claude auth status` failed in the new home")?;
     if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
-        return Err(format!(
-            "no login in {} — {}",
-            home.display(),
-            if matches!(source, Source::Managed(_)) {
-                "`claude auth login` did not complete"
-            } else {
-                "adopt a directory that holds a real login"
-            },
-        ));
+        return Err(match source {
+            Source::Ambient => {
+                "no ambient `claude` login — run `claude auth login`, then retry".to_string()
+            }
+            Source::Managed(_) => format!(
+                "no login in {} — `claude auth login` did not complete",
+                home.display()
+            ),
+            Source::Adopt(_) => format!(
+                "no login in {} — adopt a directory that holds a real login",
+                home.display()
+            ),
+        });
     }
     let email = st.get("email").and_then(Value::as_str).map(str::to_string);
     let org = st
@@ -784,6 +811,17 @@ fn admit(label: &str, source: &Source) -> Result<Insert, String> {
     mutate(true, |store| {
         if store.accounts.iter().any(|a| a.label == label) {
             return Err(format!("account {label:?} already exists"));
+        }
+        if matches!(source, Source::Ambient)
+            && let Some(a) = store
+                .accounts
+                .iter()
+                .find(|a| spawn_home(&a.home).is_none())
+        {
+            return Err(format!(
+                "the ambient login is already account {:?}",
+                a.label
+            ));
         }
         if let (Some(e), Some(o)) = (&email, &org)
             && let Some(dup) = store
@@ -818,8 +856,44 @@ fn admit(label: &str, source: &Source) -> Result<Insert, String> {
     })
 }
 
+fn ambient_label(email: Option<&str>, taken: &str) -> String {
+    let mut label: String = email
+        .and_then(|e| e.split('@').next())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(32)
+        .collect();
+    if valid_label(&label).is_err() {
+        label = "default".to_string();
+    }
+    if label == taken {
+        label.push_str("-ambient");
+    }
+    label
+}
+
+fn adopt_ambient_first(new_label: &str) -> Option<String> {
+    if !load().accounts.is_empty() {
+        return None;
+    }
+    let st = crate::setup::auth_status(None)?;
+    if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let label = ambient_label(st.get("email").and_then(Value::as_str), new_label);
+    matches!(admit(&label, &Source::Ambient), Ok(Insert::Added { .. })).then_some(label)
+}
+
 fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, String> {
     let mut home: Option<PathBuf> = None;
+    let mut ambient = false;
     let mut label: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -828,6 +902,8 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
                 return Err("--home needs a directory".into());
             };
             home = Some(expand_home(Path::new(h)));
+        } else if a == "--ambient" {
+            ambient = true;
         } else if a.starts_with('-') {
             return Err(format!("unknown flag {a:?}\n\n{USAGE}"));
         } else if label.is_none() {
@@ -838,11 +914,15 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
     }
     let label = label.ok_or_else(|| format!("account add needs a label\n\n{USAGE}"))?;
     valid_label(&label)?;
+    if ambient && home.is_some() {
+        return Err("--ambient and --home are mutually exclusive".into());
+    }
     if load().accounts.iter().any(|a| a.label == label) {
         return Err(format!("account {label:?} already exists"));
     }
     let binary = crate::setup::resolve_command().ok_or(crate::setup::INSTALL_HINT)?;
     let source = match home {
+        _ if ambient => Source::Ambient,
         Some(h) => Source::Adopt(h),
         None => Source::Managed(homes_dir().ok_or("cannot resolve GRAY_HOME")?.join(&label)),
     };
@@ -892,6 +972,11 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
             return Err(e);
         }
     }
+    let adopted = if ambient {
+        None
+    } else {
+        adopt_ambient_first(&label)
+    };
     let insert = match admit(&label, &source) {
         Ok(insert) => insert,
         Err(e) => {
@@ -922,12 +1007,17 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
                     "label": label,
                     "email": who,
                     "selected": selected,
+                    "adopted_ambient": adopted,
                 }));
             }
-            Ok(format!(
+            let mut msg = format!(
                 "account {label:?} added ({who}); home {}",
-                source.home().display()
-            ))
+                home_text(source.home())
+            );
+            if let Some(a) = adopted {
+                msg.push_str(&format!("\nambient login adopted as {a:?}"));
+            }
+            Ok(msg)
         }
     }
 }
@@ -1025,12 +1115,13 @@ fn cmd_remove(args: &[String], json: bool) -> Result<String, String> {
     let mut msg = format!("account {label:?} removed");
     if !keep
         && let Some(dir) = homes_dir()
-        && acc.home.starts_with(&dir)
-        && acc.home.is_dir()
+        && let Some(home) = spawn_home(&acc.home)
+        && home.starts_with(&dir)
+        && home.is_dir()
     {
-        std::fs::remove_dir_all(&acc.home)
-            .map_err(|e| format!("removed {label:?} but not {}: {e}", acc.home.display()))?;
-        msg.push_str(&format!(" and its credential home {}", acc.home.display()));
+        std::fs::remove_dir_all(home)
+            .map_err(|e| format!("removed {label:?} but not {}: {e}", home.display()))?;
+        msg.push_str(&format!(" and its credential home {}", home.display()));
     }
     if json {
         return ok_json(json!({"message": msg}));
@@ -1061,7 +1152,7 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
         a.label,
         state,
         who,
-        a.home.display()
+        home_text(&a.home)
     )
 }
 
@@ -1094,7 +1185,11 @@ fn cmd_status(json: bool) -> Result<String, String> {
     let now = now_secs();
     let mut out = match serve(&store) {
         Serving::Account(p) => {
-            format!("serving account: {} (home {})\n", p.label, p.home.display())
+            format!(
+                "serving account: {} (home {})\n",
+                p.label,
+                home_text(p.home.as_deref().unwrap_or(Path::new("")))
+            )
         }
         Serving::Ambient => "serving account: (none)".to_string(),
         Serving::AllCooling { reason, .. } => format!("serving account: {reason}\n"),
@@ -1210,7 +1305,7 @@ fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
             std::thread::spawn(move || {
                 let outcome = crate::usage::handle(pick.as_ref())
                     .map(|mut card| {
-                        if pick.is_none()
+                        if pick.as_ref().is_none_or(|p| p.home.is_none())
                             && let Some(email) = crate::setup::auth_status(None)
                                 .and_then(|s| s.get("email")?.as_str().map(str::to_string))
                         {
@@ -1268,5 +1363,5 @@ pub fn probe_pick() -> Option<Pick> {
 
 /// Just the home of [`probe_pick`].
 pub fn probe_home() -> Option<PathBuf> {
-    probe_pick().map(|p| p.home)
+    probe_pick().and_then(|p| p.home)
 }
