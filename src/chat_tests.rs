@@ -315,7 +315,7 @@ fn fold_treats_max_turns_with_calls_as_tool_boundary() {
 }
 
 #[test]
-fn fold_rejects_foreign_tools() {
+fn fold_skips_foreign_tools() {
     let lines = vec![
         json!({"type": "assistant", "message": {"role": "assistant",
             "content": [{"type": "tool_use", "id": "t1", "name": "rm_rf", "input": {}}]}}),
@@ -323,7 +323,11 @@ fn fold_rejects_foreign_tools() {
             "usage": {"input_tokens": 1, "output_tokens": 1}}),
     ];
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
-    assert!(fold_lines(&lines, &["bash".to_string()], &say).is_err());
+    let (sse, _, _, calls, _, stop) = fold_lines(&lines, &["bash".to_string()], &say).unwrap();
+    assert!(calls.is_empty());
+    assert_eq!(stop, "completed");
+    let s = String::from_utf8(sse).unwrap();
+    assert!(!s.contains("function_call"), "{s}");
 }
 
 #[test]
