@@ -440,12 +440,9 @@ pub fn verify(p: &Pick) -> Result<(), String> {
     let got = st.get("email").and_then(Value::as_str);
     let problem = if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
         Some(format!("signed out: no login in {home}"))
-    } else if let Some(g) = got.filter(|g| !g.eq_ignore_ascii_case(&want)) {
-        Some(format!(
-            "signed out: {home} is logged in as {g}, not {want}"
-        ))
     } else {
-        None
+        got.filter(|g| !g.eq_ignore_ascii_case(&want))
+            .map(|g| format!("signed out: {home} is logged in as {g}, not {want}"))
     };
     let _ = mutate(false, |store| {
         if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
