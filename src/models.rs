@@ -43,6 +43,7 @@ pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 pub fn catalog_from(s: &Snapshot) -> ProviderModelCatalog {
     let models = catalog::all_ids_in(s)
         .into_iter()
+        .filter(|id| id.starts_with("claude-"))
         .map(|id| ProviderModel {
             name: catalog::display_name_in(&id, s),
             context_window: catalog::context_window_in(&id, s),
