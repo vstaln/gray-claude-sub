@@ -77,6 +77,9 @@ pub enum Health {
         until: u64,
         msg: String,
     },
+    SignedOut {
+        msg: String,
+    },
     #[default]
     #[serde(other)]
     Ready,
@@ -261,13 +264,14 @@ fn current(a: &Account, now: u64) -> Health {
         Health::Cooling { until, .. } | Health::AuthFailed { until, .. } if *until > now => {
             a.health.clone()
         }
+        Health::SignedOut { .. } => a.health.clone(),
         _ => Health::Ready,
     }
 }
 
 fn until_of(h: &Health) -> u64 {
     match h {
-        Health::Ready => 0,
+        Health::Ready | Health::SignedOut { .. } => 0,
         Health::Cooling { until, .. } | Health::AuthFailed { until, .. } => *until,
     }
 }
@@ -276,7 +280,7 @@ fn reason_of(h: &Health) -> Option<String> {
     match h {
         Health::Ready => None,
         Health::Cooling { reason, .. } => Some(reason.clone()),
-        Health::AuthFailed { msg, .. } => Some(msg.clone()),
+        Health::AuthFailed { msg, .. } | Health::SignedOut { msg } => Some(msg.clone()),
     }
 }
 
@@ -342,11 +346,20 @@ fn serve(store: &Store) -> Serving {
     if let Some(a) = next {
         return Serving::Account(pick_of(a));
     }
-    let soon = store
+    let Some(soon) = store
         .accounts
         .iter()
+        .filter(|a| !matches!(a.health, Health::SignedOut { .. }))
         .min_by_key(|a| until_of(&current(a, now)))
-        .expect("nonempty");
+    else {
+        return Serving::AllCooling {
+            until: 0,
+            reason: format!(
+                "all {} claude accounts are signed out; log in again",
+                store.accounts.len()
+            ),
+        };
+    };
     let until = until_of(&current(soon, now));
     Serving::AllCooling {
         until,
@@ -367,8 +380,24 @@ pub fn serving() -> Serving {
 
 /// Per-turn selection: resolve the serving account and record the use.
 pub fn pick() -> Result<Option<Pick>, String> {
-    if load_checked()?.accounts.is_empty() {
+    let n = load_checked()?.accounts.len();
+    if n == 0 {
         return Ok(None);
+    }
+    for _ in 0..=n {
+        match serving() {
+            Serving::Account(p) if verify(&p).is_err() => {}
+            Serving::AllCooling { .. } => {
+                let back = signed_out_picks()
+                    .iter()
+                    .filter(|p| verify(p).is_ok())
+                    .count();
+                if back == 0 {
+                    break;
+                }
+            }
+            _ => break,
+        }
     }
     mutate(false, |store| match serve(store) {
         Serving::Account(p) => {
@@ -381,6 +410,54 @@ pub fn pick() -> Result<Option<Pick>, String> {
         Serving::Ambient => Ok(None),
         Serving::AllCooling { reason, .. } => Err(reason),
     })
+}
+
+fn signed_out_picks() -> Vec<Pick> {
+    load()
+        .accounts
+        .iter()
+        .filter(|a| matches!(a.health, Health::SignedOut { .. }))
+        .map(pick_of)
+        .collect()
+}
+
+/// Checks the login actually present in the account's home is the one
+/// stored for it. A missing login or a different email marks the account
+/// `SignedOut` (never served, never probed); a match clears that mark.
+pub fn verify(p: &Pick) -> Result<(), String> {
+    let Some(want) = load()
+        .accounts
+        .iter()
+        .find(|a| a.label == p.label)
+        .and_then(|a| a.email.clone())
+    else {
+        return Ok(());
+    };
+    let Some(st) = crate::setup::auth_status(p.home.as_deref()) else {
+        return Ok(());
+    };
+    let home = home_text(p.home.as_deref().unwrap_or(Path::new("")));
+    let got = st.get("email").and_then(Value::as_str);
+    let problem = if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
+        Some(format!("signed out: no login in {home}"))
+    } else if let Some(g) = got.filter(|g| !g.eq_ignore_ascii_case(&want)) {
+        Some(format!(
+            "signed out: {home} is logged in as {g}, not {want}"
+        ))
+    } else {
+        None
+    };
+    let _ = mutate(false, |store| {
+        if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
+            match (&problem, &a.health) {
+                (Some(msg), _) => a.health = Health::SignedOut { msg: msg.clone() },
+                (None, Health::SignedOut { .. }) => a.health = Health::Ready,
+                _ => {}
+            }
+        }
+        Ok(())
+    });
+    problem.map_or(Ok(()), Err)
 }
 
 /// The turn this account served succeeded: clear any recorded failure.
@@ -643,9 +720,8 @@ claude-sub account — multiple Claude logins behind one provider.
   claude-sub account add [--home <dir>] <label>   run `claude auth login` into a
                                                   new credential home (or adopt
                                                   an existing CLAUDE_CONFIG_DIR)
-  claude-sub account add --ambient <label>         adopt the plain `claude` login
-                                                  (spawned without CLAUDE_CONFIG_DIR);
-                                                  the first add does this on its own
+  claude-sub account login <label>                 run `claude auth login` again for an
+                                                  account whose login is gone or wrong
   claude-sub account list                          accounts + health
   claude-sub account use <label>                   pin an account (use --clear to unpin)
   claude-sub account remove [--keep] <label>       drop an account (+its managed home)
@@ -673,6 +749,7 @@ pub fn command(args: &[String], interactive: bool) -> Result<String, String> {
         .collect();
     match args.first().map(String::as_str) {
         Some("add") => cmd_add(&args[1..], interactive, json),
+        Some("login") => cmd_login(&args[1..], interactive, json),
         Some("use") => cmd_use(&args[1..], json),
         Some("remove") | Some("rm") => cmd_remove(&args[1..], json),
         Some("strategy") => cmd_strategy(&args[1..], json),
@@ -754,14 +831,12 @@ fn valid_label(label: &str) -> Result<(), String> {
 enum Source {
     Adopt(PathBuf),
     Managed(PathBuf),
-    Ambient,
 }
 
 impl Source {
     fn home(&self) -> &Path {
         match self {
             Source::Adopt(h) | Source::Managed(h) => h.as_path(),
-            Source::Ambient => Path::new(""),
         }
     }
 }
@@ -783,9 +858,6 @@ fn admit(label: &str, source: &Source) -> Result<Insert, String> {
         .ok_or("`claude auth status` failed in the new home")?;
     if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
         return Err(match source {
-            Source::Ambient => {
-                "no ambient `claude` login — run `claude auth login`, then retry".to_string()
-            }
             Source::Managed(_) => format!(
                 "no login in {} — `claude auth login` did not complete",
                 home.display()
@@ -811,17 +883,6 @@ fn admit(label: &str, source: &Source) -> Result<Insert, String> {
     mutate(true, |store| {
         if store.accounts.iter().any(|a| a.label == label) {
             return Err(format!("account {label:?} already exists"));
-        }
-        if matches!(source, Source::Ambient)
-            && let Some(a) = store
-                .accounts
-                .iter()
-                .find(|a| spawn_home(&a.home).is_none())
-        {
-            return Err(format!(
-                "the ambient login is already account {:?}",
-                a.label
-            ));
         }
         if let (Some(e), Some(o)) = (&email, &org)
             && let Some(dup) = store
@@ -856,44 +917,8 @@ fn admit(label: &str, source: &Source) -> Result<Insert, String> {
     })
 }
 
-fn ambient_label(email: Option<&str>, taken: &str) -> String {
-    let mut label: String = email
-        .and_then(|e| e.split('@').next())
-        .unwrap_or_default()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .take(32)
-        .collect();
-    if valid_label(&label).is_err() {
-        label = "default".to_string();
-    }
-    if label == taken {
-        label.push_str("-ambient");
-    }
-    label
-}
-
-fn adopt_ambient_first(new_label: &str) -> Option<String> {
-    if !load().accounts.is_empty() {
-        return None;
-    }
-    let st = crate::setup::auth_status(None)?;
-    if st.get("loggedIn").and_then(Value::as_bool) != Some(true) {
-        return None;
-    }
-    let label = ambient_label(st.get("email").and_then(Value::as_str), new_label);
-    matches!(admit(&label, &Source::Ambient), Ok(Insert::Added { .. })).then_some(label)
-}
-
 fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, String> {
     let mut home: Option<PathBuf> = None;
-    let mut ambient = false;
     let mut label: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -901,9 +926,11 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
             let Some(h) = it.next() else {
                 return Err("--home needs a directory".into());
             };
-            home = Some(expand_home(Path::new(h)));
-        } else if a == "--ambient" {
-            ambient = true;
+            let h = expand_home(Path::new(h));
+            if h.as_os_str().is_empty() {
+                return Err("--home needs a directory".into());
+            }
+            home = Some(h);
         } else if a.starts_with('-') {
             return Err(format!("unknown flag {a:?}\n\n{USAGE}"));
         } else if label.is_none() {
@@ -914,15 +941,11 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
     }
     let label = label.ok_or_else(|| format!("account add needs a label\n\n{USAGE}"))?;
     valid_label(&label)?;
-    if ambient && home.is_some() {
-        return Err("--ambient and --home are mutually exclusive".into());
-    }
     if load().accounts.iter().any(|a| a.label == label) {
         return Err(format!("account {label:?} already exists"));
     }
     let binary = crate::setup::resolve_command().ok_or(crate::setup::INSTALL_HINT)?;
     let source = match home {
-        _ if ambient => Source::Ambient,
         Some(h) => Source::Adopt(h),
         None => Source::Managed(homes_dir().ok_or("cannot resolve GRAY_HOME")?.join(&label)),
     };
@@ -972,11 +995,6 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
             return Err(e);
         }
     }
-    let adopted = if ambient {
-        None
-    } else {
-        adopt_ambient_first(&label)
-    };
     let insert = match admit(&label, &source) {
         Ok(insert) => insert,
         Err(e) => {
@@ -1007,19 +1025,74 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
                     "label": label,
                     "email": who,
                     "selected": selected,
-                    "adopted_ambient": adopted,
                 }));
             }
-            let mut msg = format!(
+            Ok(format!(
                 "account {label:?} added ({who}); home {}",
                 home_text(source.home())
-            );
-            if let Some(a) = adopted {
-                msg.push_str(&format!("\nambient login adopted as {a:?}"));
-            }
-            Ok(msg)
+            ))
         }
     }
+}
+
+fn cmd_login(args: &[String], interactive: bool, json: bool) -> Result<String, String> {
+    let [label] = args else {
+        return Err(format!("account login needs a label\n\n{USAGE}"));
+    };
+    if !interactive {
+        return Err(
+            "account login runs `claude auth login`; use `gray claude-sub account login <label>` in a terminal"
+                .into(),
+        );
+    }
+    let stored = load()
+        .accounts
+        .iter()
+        .find(|a| a.label == *label)
+        .map(|a| a.home.clone())
+        .ok_or_else(|| format!("no account labelled {label:?}"))?;
+    let default_home = crate::session::home_dir().map(|h| normalize(&h.join(".claude")));
+    let dest = match spawn_home(&stored).map(expand_home) {
+        Some(h) if default_home.as_ref() != Some(&normalize(&h)) => h,
+        _ => homes_dir().ok_or("cannot resolve GRAY_HOME")?.join(label),
+    };
+    let binary = crate::setup::resolve_command().ok_or(crate::setup::INSTALL_HINT)?;
+    std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700));
+    }
+    eprintln!("logging {label:?} into {} …", dest.display());
+    let status = std::process::Command::new(&binary)
+        .args(["auth", "login"])
+        .envs(crate::setup::child_env())
+        .env("CLAUDE_CONFIG_DIR", &dest)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("spawn claude auth login: {e}"))?;
+    if !status.success() {
+        return Err(format!("`claude auth login` exited {status}"));
+    }
+    mutate(true, |store| {
+        if let Some(a) = store.accounts.iter_mut().find(|a| a.label == *label) {
+            a.home = dest.clone();
+        }
+        Ok(())
+    })?;
+    verify(&Pick {
+        label: label.clone(),
+        home: Some(dest.clone()),
+    })?;
+    if json {
+        return ok_json(json!({"message": format!("account {label:?} logged in"), "label": label}));
+    }
+    Ok(format!(
+        "account {label:?} logged in; home {}",
+        dest.display()
+    ))
 }
 
 fn cmd_use(args: &[String], json: bool) -> Result<String, String> {
@@ -1145,6 +1218,7 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
             "auth failed until {}",
             crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(until))
         ),
+        Health::SignedOut { .. } => "signed out".to_string(),
     };
     let who = a.email.clone().unwrap_or_else(|| "-".to_string());
     format!(

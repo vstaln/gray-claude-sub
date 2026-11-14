@@ -55,6 +55,9 @@ fn now_secs() -> u64 {
 /// pooled `account` reads its own cache and probes its own credential
 /// home — one login's quota windows never report another's.
 pub fn handle(account: Option<&crate::accounts::Pick>) -> Result<Value, ProviderRpcError> {
+    if let Some(p) = account {
+        crate::accounts::verify(p).map_err(ProviderRpcError::Unavailable)?;
+    }
     let label = account.map(|p| p.label.as_str());
     if let Some((limits, fetched)) = read_cache(label)
         && now_secs().saturating_sub(fetched) < CACHE_TTL_SECS
