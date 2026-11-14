@@ -332,14 +332,20 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     // a global "logged in" verdict would hide a sibling account's gap.
     static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if account.is_some() || !LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
-        match setup::probe_login(account.as_ref().map(|p| p.home.as_path())) {
+        match setup::probe_login(account.as_ref().and_then(|p| p.home.as_deref())) {
             setup::LoginState::LoggedOut => {
                 return Err(ProviderRpcError::Unavailable(match &account {
-                    Some(p) => format!(
-                        "Claude account {:?} has no login in {}",
-                        p.label,
-                        p.home.display()
-                    ),
+                    Some(p) => match &p.home {
+                        Some(h) => format!(
+                            "Claude account {:?} has no login in {}",
+                            p.label,
+                            h.display()
+                        ),
+                        None => format!(
+                            "Claude account {:?} (the ambient login) has no login: run `claude auth login`, then retry.",
+                            p.label
+                        ),
+                    },
                     None => setup::LOGIN_HINT.into(),
                 }));
             }

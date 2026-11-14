@@ -27,7 +27,7 @@ use gray_plugin::ProviderRpcError;
 const CACHE_TTL_SECS: u64 = 5 * 60;
 /// Hard cap on the probe child's lifetime: init + control_response is
 /// normally seconds; a hung spawn must not hang `/usage`.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 
 const SESSION_MINS: u64 = 5 * 60;
 const WEEK_MINS: u64 = 7 * 24 * 60;
@@ -55,13 +55,16 @@ fn now_secs() -> u64 {
 /// pooled `account` reads its own cache and probes its own credential
 /// home — one login's quota windows never report another's.
 pub fn handle(account: Option<&crate::accounts::Pick>) -> Result<Value, ProviderRpcError> {
+    if let Some(p) = account {
+        crate::accounts::verify(p).map_err(ProviderRpcError::Unavailable)?;
+    }
     let label = account.map(|p| p.label.as_str());
     if let Some((limits, fetched)) = read_cache(label)
         && now_secs().saturating_sub(fetched) < CACHE_TTL_SECS
     {
         return Ok(limits);
     }
-    match probe(account.map(|p| p.home.as_path())) {
+    match probe(account.and_then(|p| p.home.as_deref())) {
         Ok(limits) => {
             write_cache(&limits, now_secs(), label);
             Ok(limits)
@@ -87,12 +90,11 @@ fn write_cache(limits: &Value, fetched: u64, label: Option<&str>) {
     let Some(path) = cache_path(label) else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(
-        path,
-        json!({"fetched_at": fetched, "limits": limits}).to_string(),
+    let _ = crate::session::write_atomic(
+        &path,
+        json!({"fetched_at": fetched, "limits": limits})
+            .to_string()
+            .as_bytes(),
     );
 }
 
@@ -167,7 +169,8 @@ fn probe(home: Option<&std::path::Path>) -> Result<Value, ProviderRpcError> {
     ])
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
-    .stderr(Stdio::null());
+    .stderr(Stdio::null())
+    .env("CLAUDE_CODE_ENTRYPOINT", "gray");
     if let Some(h) = home {
         cmd.env("CLAUDE_CONFIG_DIR", h);
     }

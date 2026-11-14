@@ -41,6 +41,13 @@ pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Render a snapshot as the protocol catalog. Pure — tests drive it with
 /// synthetic snapshots, never the network.
 pub fn catalog_from(s: &Snapshot) -> ProviderModelCatalog {
+    let s = &Snapshot::new(
+        s.models
+            .iter()
+            .filter(|m| m.id.starts_with("claude-"))
+            .cloned()
+            .collect(),
+    );
     let models = catalog::all_ids_in(s)
         .into_iter()
         .map(|id| ProviderModel {
