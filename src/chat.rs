@@ -837,16 +837,15 @@ pub fn fold_lines(
                                         .unwrap_or("")
                                         .to_string();
                                     let full = b.get("name").and_then(Value::as_str).unwrap_or("");
-                                    let Some(short) = full.strip_prefix(TOOL_PREFIX) else {
-                                        return Err(format!(
-                                            "native returned a tool outside the current host inventory: {full:?}"
-                                        ));
+                                    let Some(short) = full
+                                        .strip_prefix(TOOL_PREFIX)
+                                        .filter(|s| names.iter().any(|n| n == s))
+                                    else {
+                                        eprintln!(
+                                            "claude-sub: native called {full:?}, outside the host inventory; native answers it"
+                                        );
+                                        continue;
                                     };
-                                    if !names.contains(&short.to_string()) {
-                                        return Err(format!(
-                                            "native returned a tool outside the current host inventory: {full:?}"
-                                        ));
-                                    }
                                     let input = b.get("input").cloned().unwrap_or(json!({}));
                                     let args = serde_json::to_string(&input)
                                         .unwrap_or_else(|_| "{}".into());
