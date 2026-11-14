@@ -75,6 +75,7 @@ const IDLE_WINDOW: Duration = Duration::from_secs(180);
 /// Absolute per-turn cap regardless of activity —
 /// `GRAY_CLAUDE_MAX_SECS` overrides.
 const MAX_TURN: Duration = Duration::from_secs(60 * 60);
+const FIRST_BYTE_WINDOW: Duration = Duration::from_secs(60);
 /// A delta's `function_call_output` answering nothing this session parked
 /// or answered means the history belongs to another conversation.
 const NOTE_UNDELIVERED: &str = "[Harness note] Your previous reply was interrupted by the user and never delivered; none of its tool calls ran.";
@@ -91,6 +92,14 @@ fn env_secs(name: &str, default: Duration) -> Duration {
 /// Per-drain no-activity window.
 fn idle_window() -> Duration {
     env_secs("GRAY_CLAUDE_IDLE_SECS", IDLE_WINDOW)
+}
+
+fn first_byte_window() -> Duration {
+    env_secs("GRAY_CLAUDE_FIRST_BYTE_SECS", FIRST_BYTE_WINDOW)
+}
+
+fn nothing_sent(window: Duration) -> String {
+    format!("Claude sent nothing for {}s", window.as_secs())
 }
 
 /// Absolute per-turn cap; the relay passes it to [`run_turn`].
@@ -204,6 +213,9 @@ pub struct LiveSession {
     /// No-activity window before a drain gives up; stream progress
     /// resets it. `deadline` remains the absolute cap.
     idle: Duration,
+    first_byte: Duration,
+    sent_at: Option<Instant>,
+    heard: bool,
 }
 
 /// Enough of a checked-out session to guess whether a turn could use it:
@@ -794,6 +806,8 @@ impl LiveSession {
             self.sent.push(frame);
         }
         self.running += 1;
+        self.sent_at = Some(Instant::now());
+        self.heard = false;
         Ok(uuid)
     }
 
@@ -826,6 +840,8 @@ impl LiveSession {
         if self.running == 0 {
             return Err("history contains no user frames".into());
         }
+        self.sent_at = Some(Instant::now());
+        self.heard = false;
         Ok(())
     }
 
@@ -1008,6 +1024,9 @@ impl LiveSession {
         if let Some(msg) = chat::rate_limit_rejection(&v) {
             return Err(msg);
         }
+        if answer_line(&v) {
+            self.heard = true;
+        }
         match v.get("type").and_then(Value::as_str) {
             Some("stream_event") => match v.pointer("/event/type").and_then(Value::as_str) {
                 Some("message_start") => self.in_msg = true,
@@ -1015,6 +1034,23 @@ impl LiveSession {
                 _ => {}
             },
             Some("system") => {
+                if v.get("subtype").and_then(Value::as_str) == Some("api_retry") {
+                    let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+                    let max = v.get("max_retries").and_then(Value::as_u64).unwrap_or(0);
+                    let why = v
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            v.get("error_status")
+                                .and_then(Value::as_u64)
+                                .map(|code| code.to_string())
+                        })
+                        .unwrap_or_else(|| "no response".to_string());
+                    eprintln!(
+                        "claude-sub: Anthropic API retrying (attempt {attempt}/{max}, {why})"
+                    );
+                }
                 if v.get("subtype").and_then(Value::as_str) == Some("init")
                     && !self.tools.is_empty()
                 {
@@ -1269,6 +1305,14 @@ impl LiveSession {
             {
                 return Err(format!("Claude request idle {}s", self.idle.as_secs()));
             }
+            if !self.heard
+                && parked.is_empty()
+                && self.bridge.unanswered_ids().is_empty()
+                && let Some(at) = self.sent_at
+                && Instant::now() >= at + self.first_byte
+            {
+                return Err(nothing_sent(self.first_byte));
+            }
             if self.bridge.is_dead() && !self.tools.is_empty() {
                 // No transport, no tool answers: this query can only hang.
                 return Err("gray MCP bridge closed".into());
@@ -1323,6 +1367,10 @@ impl LiveSession {
         self.reply_text = text.trim().to_string();
         self.last_used = Instant::now();
         self.last_contact = Some(Instant::now());
+    }
+
+    fn stalled(&self, e: &str) -> bool {
+        e == nothing_sent(self.first_byte)
     }
 
     /// Record a failed first turn whose prompt still settled upstream:
@@ -1421,6 +1469,14 @@ fn echo_of(lines: &[Value], names: &[String]) -> (Vec<String>, String) {
         }
     }
     (ids, text)
+}
+
+fn answer_line(v: &Value) -> bool {
+    match v.get("type").and_then(Value::as_str) {
+        Some("system") => v.get("subtype").and_then(Value::as_str) == Some("api_retry"),
+        Some("user") => false,
+        _ => true,
+    }
 }
 
 /// `system/init` reporting the `gray` stdio mount failed is a spawn-time
@@ -1588,6 +1644,9 @@ fn spawn_child(
         mid_frames: Vec::new(),
         rewarmed: false,
         idle: idle_window(),
+        first_byte: first_byte_window(),
+        sent_at: None,
+        heard: false,
     })
 }
 
@@ -2075,6 +2134,11 @@ fn run_turn_once(
                     &[],
                     &json!({"mode": mode, "pid": s.pid, "sid": s.sid, "error": e}),
                 );
+            }
+            if s.stalled(&e) {
+                s.absorb_failed(&turn);
+                give_back(s);
+                return Err(e);
             }
             if s.rewarmed {
                 // First drain on a re-pooled child proves the resume:
