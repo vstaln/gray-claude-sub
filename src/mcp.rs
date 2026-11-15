@@ -224,6 +224,8 @@ struct State {
     answers: HashMap<String, Value>,
     /// Set on session close: every parked call resolves `isError`.
     closed: bool,
+    /// Notifications emitted before any connection held the write half.
+    pending: Vec<Value>,
 }
 
 /// Shared bridge state: the condvar wakes parked-call waiters when an
@@ -349,7 +351,17 @@ impl Bridge {
     /// dead socket only flags the bridge.
     fn write_msg(&self, v: &Value) {
         let mut guard = self.shared.write.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(conn) = guard.as_mut() else { return };
+        let Some(conn) = guard.as_mut() else {
+            if v.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed") {
+                self.shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .push(v.clone());
+            }
+            return;
+        };
         if write_line(conn, v).is_err() {
             drop(guard);
             self.flag_dead();
@@ -496,12 +508,25 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
         }
         let id = v.get("id").cloned().unwrap_or(Value::Null);
         let method = v.get("method").and_then(Value::as_str);
-        if method != Some("server/discover") && !session {
-            // First real request: this conn becomes the session conn —
-            // notifications and parked-call answers ride its write half.
+        if !session && matches!(method, Some("initialize") | Some("tools/call")) {
+            // Only the conn that speaks for a session may claim the write
+            // half: a probe conn (server/discover, tools/list, ping) is
+            // short-lived, and its EOF must not kill the transport.
             session = true;
             if let Ok(w) = writer.try_clone() {
-                *shared.write.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+                let pending = {
+                    let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    std::mem::take(&mut st.pending)
+                };
+                let mut guard = shared.write.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(w);
+                if let Some(conn) = guard.as_mut() {
+                    for v in &pending {
+                        if write_line(conn, v).is_err() {
+                            break;
+                        }
+                    }
+                }
             }
         }
         let answered = match method {

@@ -1479,10 +1479,11 @@ fn answer_line(v: &Value) -> bool {
     }
 }
 
-/// `system/init` reporting the `gray` stdio mount failed is a spawn-time
-/// flake — the child's `claude-sub mcp` shim never connected or claude's
-/// handshake timed out — not a verdict on the session. The failed child
-/// closes itself, so one respawn on a fresh socket almost always mounts.
+/// `system/init` reporting the `gray` stdio mount failed means the child's
+/// `claude-sub mcp` shim never connected or claude's handshake timed out —
+/// a transport fault, not a verdict on the session. The value is a prefix:
+/// the emitted line appends the server list and the native stderr tail. The
+/// failed child closes itself, so one respawn on a fresh socket retries.
 const MCP_MOUNT_FAILED: &str = "gray MCP server failed to connect";
 
 /// Spawn a live child: bind the `gray` socket, write `tail` frames into
@@ -1498,13 +1499,11 @@ fn spawn_live(
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
     let (parked_tx, parked_rx) = channel();
     let bridge = Bridge::bind(parked_tx).map_err(|e| format!("mcp transport: {e}"))?;
+    bridge.set_tools(tools.clone());
     let endpoint = bridge.endpoint().to_string();
     let mut s = spawn_child(
         turn, tools, effort, resume, &endpoint, bridge, parked_rx, home,
     )?;
-    // The bridge is bound before the child spawns; claude's
-    // initialize/tools/list can arrive as soon as it mounts `gray`.
-    s.bridge.set_tools(s.tools.clone());
     s.seed_auto(&turn.frames);
     if let Err(e) = s.write_history(tail) {
         // A dead pipe mid-load is untrusted — but still drain: a refused
@@ -1957,23 +1956,32 @@ pub fn run_turn(
     timeout: Duration,
     account_home: Option<&Path>,
 ) -> Result<Vec<Value>, String> {
+    let home = session::claude_home(account_home);
+    let before = cred_stamp(home.as_deref());
     let first = run_turn_once(body, model, effort, timeout, account_home);
     match &first {
-        // A 401 on a long-lived child usually means its in-memory OAuth
-        // state went stale: several children share one credential home and
-        // a sibling's refresh rotated the token out from under it. The
-        // failing session was closed, not pooled, so this retry cold-starts
-        // a fresh `claude`, which re-reads the credential file on disk.
-        // A second 401 is a genuinely dead login and goes through as-is.
-        Err(e) if is_auth_401(e) => {
+        Err(e) if is_auth_401(e) && cred_stamp(home.as_deref()) != before => {
             if debug_on() {
-                eprintln!("claude-sub: 401 on a live child; retrying once on a fresh child");
+                eprintln!("claude-sub: 401 after the credential file changed; retrying once");
             }
-            std::thread::sleep(Duration::from_secs(2));
             run_turn_once(body, model, effort, timeout, account_home)
         }
         _ => first,
     }
+}
+
+/// Identity of the credential file a child would read at spawn, under the
+/// home's lock so a sibling's refresh is never read half-written.
+fn cred_stamp(home: Option<&Path>) -> Option<(u64, u64)> {
+    let path = session::claude_home(home)?.join(".credentials.json");
+    let _lock = session::lock_file(&path).ok()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in &bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some((bytes.len() as u64, hash))
 }
 
 /// Answer a host side request (`x-gray-isolated`: a compaction summary) on
