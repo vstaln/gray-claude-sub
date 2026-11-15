@@ -361,10 +361,11 @@ fn serve(store: &Store) -> Serving {
         };
     };
     let until = until_of(&current(soon, now));
+    let mins = until.saturating_sub(now).div_ceil(60).max(1);
     Serving::AllCooling {
         until,
         reason: format!(
-            "all {} claude accounts are cooling down; {} next at {}",
+            "all {} claude accounts are cooling down; {} next at {} · resets in ~{mins}m",
             store.accounts.len(),
             soon.label,
             crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(until)),
