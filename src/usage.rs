@@ -55,11 +55,24 @@ fn now_secs() -> u64 {
 /// pooled `account` reads its own cache and probes its own credential
 /// home — one login's quota windows never report another's.
 pub fn handle(account: Option<&crate::accounts::Pick>) -> Result<Value, ProviderRpcError> {
+    handle_opts(account, false)
+}
+
+/// `handler` for a manual refresh: skip the cache and probe now.
+pub fn handle_fresh(account: Option<&crate::accounts::Pick>) -> Result<Value, ProviderRpcError> {
+    handle_opts(account, true)
+}
+
+pub fn handle_opts(
+    account: Option<&crate::accounts::Pick>,
+    fresh: bool,
+) -> Result<Value, ProviderRpcError> {
     if let Some(p) = account {
         crate::accounts::verify(p).map_err(ProviderRpcError::Unavailable)?;
     }
     let label = account.map(|p| p.label.as_str());
-    if let Some((limits, fetched)) = read_cache(label)
+    if !fresh
+        && let Some((limits, fetched)) = read_cache(label)
         && now_secs().saturating_sub(fetched) < CACHE_TTL_SECS
     {
         return Ok(limits);
@@ -77,6 +90,11 @@ pub fn handle(account: Option<&crate::accounts::Pick>) -> Result<Value, Provider
             Err(e)
         }
     }
+}
+
+/// The cached card for one login, without probing.
+pub fn cached(label: &str) -> Option<(Value, u64)> {
+    read_cache(Some(label))
 }
 
 fn read_cache(label: Option<&str>) -> Option<(Value, u64)> {
