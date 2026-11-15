@@ -1825,7 +1825,7 @@ fn spawn_live_retried(
     home: Option<&Path>,
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
     match spawn_live(turn, tools.clone(), effort, resume, tail, deadline, home) {
-        Err(e) if e == MCP_MOUNT_FAILED => {
+        Err(e) if e.starts_with(MCP_MOUNT_FAILED) => {
             spawn_live(turn, tools, effort, resume, tail, deadline, home)
         }
         r => r,
