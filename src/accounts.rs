@@ -313,6 +313,92 @@ fn transition(h: &Health, outcome: &Outcome, now: u64, lone: bool) -> Health {
     }
 }
 
+/// A cached 429 can outlive the window it came from: Claude's five-hour
+/// session resets on a rolling clock, and a refresh or a plan switch can
+/// clear it early. Before telling the caller every account is cooling,
+/// ask the live usage endpoint and drop cooldowns that no longer hold.
+const MAX_SESSION_COOL: u64 = 1800;
+
+/// A cached 429 outlives the window it came from: Claude's five-hour
+/// session runs on a rolling clock, so a cooldown parsed out of error text
+/// can point hours past the real reset. Correct every cooldown from the
+/// usage cache when it is fresh, and never let a session cooldown stand
+/// longer than half an hour — the next attempt re-checks.
+fn heal_cooling(store: &mut Store, now: u64) {
+    for a in store.accounts.iter_mut() {
+        let Health::Cooling { until, reason } = current(a, now) else {
+            continue;
+        };
+        if let Some((limits, fetched)) = crate::usage::cached(&a.label)
+            && now.saturating_sub(fetched) < 15 * 60
+            && let Some(ws) = limits.get("windows").and_then(Value::as_array)
+        {
+            let blocked: Vec<&Value> = ws
+                .iter()
+                .filter(|w| {
+                    w.get("used_percent")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|p| p >= 100.0)
+                })
+                .collect();
+            if blocked.is_empty() {
+                a.health = Health::Ready;
+                continue;
+            }
+            let reset = blocked
+                .iter()
+                .filter_map(|w| {
+                    w.get("resets_at")
+                        .and_then(Value::as_str)
+                        .and_then(iso_epoch)
+                })
+                .max();
+            if let Some(r) = reset.filter(|r| *r > now as i64) {
+                a.health = Health::Cooling {
+                    until: r as u64,
+                    reason: reason.clone(),
+                };
+                continue;
+            }
+        }
+        let low = reason.to_lowercase();
+        let session = low.contains("five_hour") || low.contains("session limit");
+        if session && until > now + MAX_SESSION_COOL {
+            a.health = Health::Cooling {
+                until: now + MAX_SESSION_COOL,
+                reason: reason.clone(),
+            };
+        }
+    }
+}
+
+fn cmd_reset(args: &[String], json: bool) -> Result<String, String> {
+    let all = args.iter().any(|a| a == "--all") || args.is_empty();
+    let want = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let cleared = mutate(true, |store| {
+        let mut cleared: Vec<String> = Vec::new();
+        for a in store.accounts.iter_mut() {
+            if !all && want.as_deref() != Some(a.label.as_str()) {
+                continue;
+            }
+            if matches!(current(a, now_secs()), Health::Cooling { .. }) {
+                a.health = Health::Ready;
+                cleared.push(a.label.clone());
+            }
+        }
+        Ok(cleared)
+    })?;
+    if json {
+        return serde_json::to_string_pretty(&json!({"ok": true, "cleared": cleared}))
+            .map_err(|e| e.to_string());
+    }
+    Ok(if cleared.is_empty() {
+        "no cached cooldowns to clear".to_string()
+    } else {
+        format!("cleared {}", cleared.join(", "))
+    })
+}
+
 fn pick_of(a: &Account) -> Pick {
     Pick {
         label: a.label.clone(),
@@ -361,10 +447,11 @@ fn serve(store: &Store) -> Serving {
         };
     };
     let until = until_of(&current(soon, now));
+    let mins = until.saturating_sub(now).div_ceil(60).max(1);
     Serving::AllCooling {
         until,
         reason: format!(
-            "all {} claude accounts are cooling down; {} next at {}",
+            "all {} claude accounts are cooling down; {} next at {} · resets in ~{mins}m",
             store.accounts.len(),
             soon.label,
             crate::session::iso_timestamp(UNIX_EPOCH + Duration::from_secs(until)),
@@ -399,16 +486,19 @@ pub fn pick() -> Result<Option<Pick>, String> {
             _ => break,
         }
     }
-    mutate(false, |store| match serve(store) {
-        Serving::Account(p) => {
-            if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
-                a.request_count += 1;
-                a.last_used_at = now_secs();
+    mutate(false, |store| {
+        heal_cooling(store, now_secs());
+        match serve(store) {
+            Serving::Account(p) => {
+                if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
+                    a.request_count += 1;
+                    a.last_used_at = now_secs();
+                }
+                Ok(Some(p))
             }
-            Ok(Some(p))
+            Serving::Ambient => Ok(None),
+            Serving::AllCooling { reason, .. } => Err(reason),
         }
-        Serving::Ambient => Ok(None),
-        Serving::AllCooling { reason, .. } => Err(reason),
     })
 }
 
@@ -722,6 +812,8 @@ claude-sub account — multiple Claude logins behind one provider.
   claude-sub account list                          accounts + health
   claude-sub account use <label>                   pin an account (use --clear to unpin)
   claude-sub account remove [--keep] <label>       drop an account (+its managed home)
+  claude-sub account reset [<label>|--all]       forget cached cooldowns and let
+                                                  the next turn re-probe usage
   claude-sub account strategy <fill_first|least_used>
                                                   pick order among usable accounts
   claude-sub account status                        which account serves now
@@ -750,6 +842,7 @@ pub fn command(args: &[String], interactive: bool) -> Result<String, String> {
         Some("use") => cmd_use(&args[1..], json),
         Some("remove") | Some("rm") => cmd_remove(&args[1..], json),
         Some("strategy") => cmd_strategy(&args[1..], json),
+        Some("reset") => cmd_reset(&args[1..], json),
         Some("status") => cmd_status(json),
         Some("usage") => cmd_usage(&args[1..], json),
         Some("list") | None => cmd_list(json),
@@ -1359,6 +1452,12 @@ impl Fetch {
 }
 
 fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
+    let fresh = args.iter().any(|a| a == "--fresh");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--fresh")
+        .cloned()
+        .collect();
     let want = args.first().map(String::as_str);
     let targets = usage_targets(&load_checked()?, want);
     let labels: Vec<Option<String>> = targets.iter().map(|(l, _)| l.clone()).collect();
@@ -1374,17 +1473,21 @@ fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
         if let Ok(pick) = target {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let outcome = crate::usage::handle(pick.as_ref())
-                    .map(|mut card| {
-                        if pick.as_ref().is_none_or(|p| p.home.is_none())
-                            && let Some(email) = crate::setup::auth_status(None)
-                                .and_then(|s| s.get("email")?.as_str().map(str::to_string))
-                        {
-                            card["email"] = json!(email);
-                        }
-                        card
-                    })
-                    .map_err(|e| e.to_string());
+                let outcome = if fresh {
+                    crate::usage::handle_fresh(pick.as_ref())
+                } else {
+                    crate::usage::handle(pick.as_ref())
+                }
+                .map(|mut card| {
+                    if pick.as_ref().is_none_or(|p| p.home.is_none())
+                        && let Some(email) = crate::setup::auth_status(None)
+                            .and_then(|s| s.get("email")?.as_str().map(str::to_string))
+                    {
+                        card["email"] = json!(email);
+                    }
+                    card
+                })
+                .map_err(|e| e.to_string());
                 let _ = tx.send((i, outcome));
             });
         }
