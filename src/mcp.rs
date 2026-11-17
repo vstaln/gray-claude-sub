@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -164,12 +164,26 @@ fn listen() -> std::io::Result<(Listener, String, Option<PathBuf>)> {
 /// Accept one connection. On TCP the client's first line must be the
 /// listener token; anything else fails `PermissionDenied` and the accept
 /// loop keeps going instead of dying on a stray probe.
+///
+/// Every accepted socket is put back in blocking mode. The listener is
+/// nonblocking so the accept loop can poll for shutdown, and Windows and
+/// BSD/macOS propagate that flag into the accepted socket (Linux does
+/// not). Left inherited, every read past the bytes already buffered fails
+/// `WouldBlock` and the conn dies right after its first reply — claude's
+/// `server/discover` probe — so `initialize` and `tools/list` never
+/// arrive, the mount never lands, and the client re-probes every 30s
+/// until the turn times out.
 fn accept(listener: &Listener) -> std::io::Result<Stream> {
     match listener {
         #[cfg(unix)]
-        Listener::Unix(l) => Ok(Stream::Unix(l.accept()?.0)),
+        Listener::Unix(l) => {
+            let (s, _) = l.accept()?;
+            s.set_nonblocking(false)?;
+            Ok(Stream::Unix(s))
+        }
         Listener::Tcp { inner, token } => {
             let (mut s, _) = inner.accept()?;
+            s.set_nonblocking(false)?;
             s.set_read_timeout(Some(Duration::from_secs(10)))?;
             let mut want = token.clone();
             want.push('\n');
@@ -224,8 +238,30 @@ struct State {
     answers: HashMap<String, Value>,
     /// Set on session close: every parked call resolves `isError`.
     closed: bool,
+    /// When the session connection went away with none open since. The
+    /// verdict on the mount is time-based because a client dropping its
+    /// transport is a moment in a healthy session, not its end.
+    session_gone_since: Option<Instant>,
     /// Notifications emitted before any connection held the write half.
     pending: Vec<Value>,
+}
+
+impl State {
+    /// The mount is gone for good: the session connection has been away
+    /// longer than the client's own retry budget, so no `tools/call` can
+    /// arrive on this bridge again.
+    fn lost(&self) -> bool {
+        self.lost_within(RECONNECT_GRACE)
+    }
+
+    /// [`State::lost`] with the window passed in, so the rule is testable
+    /// without waiting out the real grace.
+    fn lost_within(&self, grace: Duration) -> bool {
+        self.closed
+            || self
+                .session_gone_since
+                .is_some_and(|at| at.elapsed() >= grace)
+    }
 }
 
 /// Shared bridge state: the condvar wakes parked-call waiters when an
@@ -235,9 +271,51 @@ struct Shared {
     answered: Condvar,
     /// The accepted connection's write half (a `try_clone` of the reader).
     write: Mutex<Option<Stream>>,
-    /// The socket transport is gone — a dead bridge means tool calls can
-    /// never arrive, so the session itself is untrusted.
+    /// Latched when the bridge is torn down (session close), which is what
+    /// stops the accept loop for good. A client dropping its connection is
+    /// not this: that opens a reconnect window (see [`State::lost`]).
     dead: AtomicBool,
+    /// Bumped by every conn that claims the transport. A conn that has
+    /// been superseded must not arm the window when it dies — otherwise a
+    /// respawn that already mounted gets torn down 40s later by the EOF of
+    /// the conn it replaced.
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+impl Shared {
+    /// The client's connection is gone: drop the write half, open the
+    /// reconnect window and answer whatever was parked on that transport.
+    ///
+    /// Never terminal. Claude closes and reopens connections on a healthy
+    /// mount — it drops a probe sibling as the transport lands, and a mount
+    /// that hits its own 30s budget respawns `claude-sub mcp` against this
+    /// same endpoint. Ending the bridge here is what turned that respawn
+    /// into a mount that could never succeed again.
+    fn conn_lost(&self, epoch: Option<u64>) {
+        // A conn that died after a newer one claimed the transport says
+        // nothing about the mount: the live transport is the newer conn.
+        if epoch.is_some_and(|e| e != self.epoch.load(Ordering::SeqCst)) {
+            dlog("conn lost, but a newer transport owns the session");
+            return;
+        }
+        *self.write.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.session_gone_since.get_or_insert_with(Instant::now);
+            // Nothing parked on the lost transport can be delivered, and a
+            // waiter thread must not outlive its connection.
+            let stranded: Vec<String> = st.parked.keys().cloned().collect();
+            for id in stranded {
+                st.answers.insert(
+                    id,
+                    json!({"content": [{"type": "text", "text": "connection closed"}],
+                        "isError": true}),
+                );
+            }
+        }
+        dlog("conn lost, reconnect window armed");
+        self.answered.notify_all();
+    }
 }
 
 /// One session's `gray` MCP endpoint: the listener, the (single) accepted
@@ -260,6 +338,7 @@ impl Bridge {
             answered: Condvar::new(),
             write: Mutex::new(None),
             dead: AtomicBool::new(false),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         });
         let accept_shared = shared.clone();
         let accept = std::thread::spawn(move || accept_loop(listener, accept_shared, arrivals));
@@ -344,7 +423,10 @@ impl Bridge {
 
     /// The socket transport died (peer closed or a write failed).
     pub fn is_dead(&self) -> bool {
-        self.shared.dead.load(Ordering::Relaxed)
+        if self.shared.dead.load(Ordering::Relaxed) {
+            return true;
+        }
+        self.shared.state.lock().map(|st| st.lost()).unwrap_or(true)
     }
 
     /// Write a protocol message on the live connection. Best-effort: a
@@ -364,7 +446,9 @@ impl Bridge {
         };
         if write_line(conn, v).is_err() {
             drop(guard);
-            self.flag_dead();
+            // The peer closed under a write: the same moment as EOF, so the
+            // same verdict — a reconnect window, not a dead bridge.
+            self.shared.conn_lost(None);
         }
     }
 
@@ -424,9 +508,9 @@ fn write_line(w: &mut impl Write, v: &Value) -> std::io::Result<()> {
 /// until EOF or close.
 fn accept_loop(listener: Listener, shared: Arc<Shared>, arrivals: Sender<String>) {
     loop {
-        if shared.dead.load(Ordering::Relaxed)
-            || shared.state.lock().map(|st| st.closed).unwrap_or(true)
-        {
+        let ended = shared.dead.load(Ordering::Relaxed)
+            || shared.state.lock().map(|st| st.lost()).unwrap_or(true);
+        if ended {
             return;
         }
         match accept(&listener) {
@@ -475,6 +559,7 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
     // Inline replies ride THIS conn — a probe conn must never receive a
     // response meant for the session conn, and vice versa.
     let mut session = false;
+    let mut my_epoch: Option<u64> = None;
     let mut why = "peer eof";
     for line in reader.lines() {
         let line = match line {
@@ -513,6 +598,7 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
             // half: a probe conn (server/discover, tools/list, ping) is
             // short-lived, and its EOF must not kill the transport.
             session = true;
+            my_epoch = Some(shared.epoch.fetch_add(1, Ordering::SeqCst) + 1);
             if let Ok(w) = writer.try_clone() {
                 let pending = {
                     let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -520,6 +606,11 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
                 };
                 let mut guard = shared.write.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(w);
+                // A transport is back on this endpoint, so the window starts
+                // over instead of counting from the conn that went away.
+                if let Ok(mut st) = shared.state.lock() {
+                    st.session_gone_since = None;
+                }
                 if let Some(conn) = guard.as_mut() {
                     for v in &pending {
                         if write_line(conn, v).is_err() {
@@ -547,13 +638,30 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
                         {"name": "gray", "version": "1"}},
                 }}),
             ),
-            // Modern-era change subscription the client opens right after
-            // discovery. Accept it silently — we still push
-            // tools/list_changed through the normal notification path.
-            Some("subscriptions/listen") => reply(
-                &mut writer,
-                &json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            ),
+            // Modern-era change subscription: a long-lived request the
+            // client holds open for the life of the mount. It is acked by
+            // `notifications/subscriptions/acknowledged` (keyed by the
+            // request id via _meta.subscriptionId) and stays pending.
+            // Completing it with a result reads as "subscription closed
+            // before acknowledging" and makes the client churn reopen
+            // attempts: measured on claude 2.1.309, one turn opens the
+            // subscription 10 times when it is completed, 3 when it is
+            // acked.
+            Some("subscriptions/listen") => {
+                let filter = v
+                    .pointer("/params/notifications")
+                    .cloned()
+                    .unwrap_or(json!({}));
+                reply(
+                    &mut writer,
+                    &json!({"jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {
+                        "_meta": {"io.modelcontextprotocol/subscriptionId": id},
+                        "notifications": filter,
+                    }}),
+                )
+            }
             Some("initialize") => {
                 // Echo the client's protocol version verbatim.
                 let pv = v
@@ -635,14 +743,10 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
     }
     dlog(&format!("conn end ({why}) session={session}"));
     if session {
-        // A session connection went away: no more calls can arrive on it,
-        // and a reconnect still counts as a new probe until it speaks.
-        *shared.write.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        shared.dead.store(true, Ordering::Relaxed);
-        if let Ok(mut st) = shared.state.lock() {
-            st.closed = true;
-        }
-        shared.answered.notify_all();
+        // A session connection went away: no more calls arrive on it, and a
+        // reconnect counts as a new probe until it speaks. That is a
+        // reconnect window, not the end of the mount.
+        shared.conn_lost(my_epoch);
     }
 }
 
@@ -653,6 +757,14 @@ fn trace(tag: &str, v: &Value) {
         eprintln!("{tag} {}", serde_json::to_string(v).unwrap_or_default());
     }
 }
+
+/// How long the mount may go without a session connection before it is
+/// declared lost. Claude's own mount timeout is 30s and it respawns
+/// `claude-sub mcp` immediately after, so the window clears that with
+/// margin — otherwise a respawn that would have mounted lands on a listener
+/// that has already stopped accepting, and the turn dies with an
+/// empty-stderr "failed" that no host retry can fix.
+const RECONNECT_GRACE: Duration = Duration::from_secs(40);
 
 /// Milliseconds since process start — cheap clock for the conn log.
 fn t_ms() -> u128 {
@@ -684,11 +796,7 @@ fn write_or_die(shared: &Arc<Shared>, v: &Value) {
     let Some(conn) = guard.as_mut() else { return };
     if write_line(conn, v).is_err() {
         drop(guard);
-        shared.dead.store(true, Ordering::Relaxed);
-        if let Ok(mut st) = shared.state.lock() {
-            st.closed = true;
-        }
-        shared.answered.notify_all();
+        shared.conn_lost(None);
     }
 }
 
@@ -828,3 +936,7 @@ pub fn bridge_main(endpoint: &str) -> i32 {
     drop(pump);
     0
 }
+
+#[path = "mcp_tests.rs"]
+#[cfg(test)]
+mod tests;
