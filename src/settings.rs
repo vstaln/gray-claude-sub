@@ -32,6 +32,17 @@ const DEFAULT_TOOLS: &[&str] = &[
     "subagent_stop",
     "subagent_note",
     "narrow_delegate",
+    "read",
+    "edit",
+    "write",
+    "grep",
+    "glob",
+    "Read",
+    "Edit",
+    "Write",
+    "Grep",
+    "Glob",
+    "apply_patch",
 ];
 
 fn default_allow() -> BTreeSet<String> {
