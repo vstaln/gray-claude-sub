@@ -970,7 +970,35 @@ fn admit(label: &str, source: &Source) -> Result<Insert, String> {
     // Dedupe on a verified upstream identity only — `email`/`orgId` can
     // be null until the first online call, and a null never proves two
     // homes are the same account.
+    let ambient = crate::setup::auth_status(None).filter(|s| s.get("loggedIn").and_then(Value::as_bool) == Some(true));
     mutate(true, |store| {
+        if store.accounts.is_empty()
+            && let Some(amb) = &ambient
+        {
+            let amb_email = amb.get("email").and_then(Value::as_str).map(str::to_string);
+            let amb_org = amb
+                .get("orgName")
+                .and_then(Value::as_str)
+                .or_else(|| amb.get("orgId").and_then(Value::as_str))
+                .map(str::to_string);
+            let same = amb_email.is_some()
+                && amb_email == email
+                && amb_org == org;
+            if !same && label != "default" {
+                store.accounts.push(Account {
+                    label: "default".to_string(),
+                    home: PathBuf::new(),
+                    email: amb_email,
+                    org: amb_org,
+                    added_at: now_secs(),
+                    health: Health::Ready,
+                    cooldown_until: 0,
+                    last_error: None,
+                    request_count: 0,
+                    last_used_at: 0,
+                });
+            }
+        }
         if store.accounts.iter().any(|a| a.label == label) {
             return Err(format!("account {label:?} already exists"));
         }
