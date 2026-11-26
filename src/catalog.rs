@@ -266,22 +266,15 @@ pub fn native_model(model: &str) -> Result<String, String> {
     native_model_in(model, &current())
 }
 
-/// Every routable id: canonical ids, `[1m]` variants of 1M routes, and
-/// one bare alias per family present in the snapshot.
+/// Every routable id: canonical ids plus a `[1m]` variant of each 1M route.
 pub fn all_ids_in(s: &Snapshot) -> Vec<String> {
     let mut out = Vec::new();
-    let mut families: Vec<&str> = Vec::new();
     for m in &s.models {
         out.push(m.id.clone());
         if m.window == Some(1_000_000) {
             out.push(format!("{}[1m]", m.id));
         }
-        let f = family(m);
-        if !families.contains(&f) {
-            families.push(f);
-        }
     }
-    out.extend(families.into_iter().map(str::to_string));
     out.sort();
     out.dedup();
     out

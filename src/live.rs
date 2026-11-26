@@ -1052,6 +1052,15 @@ impl LiveSession {
                     );
                 }
                 if v.get("subtype").and_then(Value::as_str) == Some("init")
+                    && let Some(arr) = v.get("slash_commands").and_then(Value::as_array)
+                {
+                    let cmds: Vec<String> = arr
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect();
+                    crate::manifest::save_commands(&cmds);
+                }
+                if v.get("subtype").and_then(Value::as_str) == Some("init")
                     && !self.tools.is_empty()
                 {
                     // Claude Code ≥2.1.303 reports `pending` while the

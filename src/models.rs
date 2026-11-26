@@ -305,27 +305,45 @@ fn window_tokens(cell: &str) -> Option<u32> {
 /// points at a model page, `…/models/<slug>/overview`, and its id is
 /// `claude-<slug>`. Duplicates and links to other pages are dropped.
 fn legacy_ids(page: &str) -> Vec<String> {
-    let Some(line) = page
-        .lines()
-        .find(|l| l.trim_start().starts_with(LEGACY_LINE))
-    else {
-        return Vec::new();
-    };
     let mut ids: Vec<String> = Vec::new();
-    // Each `](` opens a link target, which ends at the next `)`.
-    for target in line.split("](").skip(1) {
-        let url = target.split(')').next().unwrap_or_default();
-        let slug = url
-            .split("/models/")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next());
-        let Some(slug) = slug else { continue };
-        let id = format!("claude-{slug}");
-        if is_model_id(&id) && !ids.contains(&id) {
-            ids.push(id);
+    for line in model_link_lines(page) {
+        // Each `](` opens a link target, which ends at the next `)`.
+        for target in line.split("](").skip(1) {
+            let url = target.split(')').next().unwrap_or_default();
+            let slug = url
+                .split("/models/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next());
+            let Some(slug) = slug else { continue };
+            let id = format!("claude-{slug}");
+            if is_model_id(&id) && !ids.contains(&id) {
+                ids.push(id);
+            }
         }
     }
     ids
+}
+
+/// Lines that carry model links: the legacy line when the page still has
+/// one, plus every table row of the `All models` listing the page moved
+/// them to (one link per row, named after the model).
+fn model_link_lines(page: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = page
+        .lines()
+        .filter(|l| l.trim_start().starts_with(LEGACY_LINE))
+        .collect();
+    let mut in_all_models = false;
+    for line in page.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            in_all_models = rest.trim().eq_ignore_ascii_case("All models");
+            continue;
+        }
+        if in_all_models && trimmed.starts_with('|') && trimmed.contains("/models/") {
+            lines.push(line);
+        }
+    }
+    lines
 }
 
 /// The fetch [`catalog::snapshot`] installs: the public page, parsed. The
