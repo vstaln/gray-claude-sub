@@ -282,7 +282,11 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                         .collect()
                 })
                 .unwrap_or_default();
-            manifest::run_command(name, &argv)
+            let raw = params.get("raw").and_then(Value::as_str);
+            let provider_id = params
+                .pointer("/session/model/provider_id")
+                .and_then(Value::as_str);
+            manifest::run_command_with_context(name, &argv, raw, provider_id)
                 .ok_or_else(|| ProviderRpcError::Protocol(format!("unknown command: {name}")))
         }
         "plugin/shutdown" => Ok(json!({})),
